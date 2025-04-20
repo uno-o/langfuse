@@ -31,6 +31,9 @@ export async function telemetry() {
     // Do not run in CI
     if (process.env.CI) return;
 
+    // Disable telemetry
+    return;
+
     // Check via db cron_jobs table if it is time to run job
     const job = await jobScheduler();
 
