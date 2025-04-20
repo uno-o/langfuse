@@ -26,9 +26,6 @@
       "cache": false,
       "dependsOn": ["^db:generate"]
     },
-    "lint": {
-      "cache": false
-    },
     "test": {
       "dependsOn": ["^test", "db:generate"]
     }
