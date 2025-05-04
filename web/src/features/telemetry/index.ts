@@ -19,12 +19,17 @@ const JOB_TIMEOUT_MINUTES = Prisma.raw("10"); // 10 minutes
 export async function telemetry() {
   try {
     // Only run in prod
-    if (process.env.NODE_ENV !== "test") return;
+    if (process.env.NODE_ENV !== "test") {
+      logger.warn("Disabled Telemetry in ", process.env.NODE_ENV);
+      return;
+    }
     // Do not run in Langfuse cloud, separate telemetry is used
     if (env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION !== undefined) return;
     // Check if telemetry is not disabled, except for EE
-    if (env.TELEMETRY_ENABLED === "false")
+    if (env.TELEMETRY_ENABLED === "false") {
+      logger.warn("Disabled Telemetry in TELEMETRY_ENABLED: ", env.TELEMETRY_ENABLED)
       return;
+    }
     // Do not run in CI
     if (process.env.CI) return;
 
