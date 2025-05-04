@@ -19,7 +19,7 @@ const JOB_TIMEOUT_MINUTES = Prisma.raw("10"); // 10 minutes
 export async function telemetry() {
   try {
     // Only run in prod
-    if (process.env.NODE_ENV !== "production") return;
+    if (process.env.NODE_ENV !== "test") return;
     // Do not run in Langfuse cloud, separate telemetry is used
     if (env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION !== undefined) return;
     // Check if telemetry is not disabled, except for EE
