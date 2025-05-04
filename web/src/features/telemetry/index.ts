@@ -23,16 +23,10 @@ export async function telemetry() {
     // Do not run in Langfuse cloud, separate telemetry is used
     if (env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION !== undefined) return;
     // Check if telemetry is not disabled, except for EE
-    if (
-      env.TELEMETRY_ENABLED === "false" &&
-      env.LANGFUSE_EE_LICENSE_KEY === undefined
-    )
+    if (env.TELEMETRY_ENABLED === "false")
       return;
     // Do not run in CI
     if (process.env.CI) return;
-
-    // Disable telemetry
-    return;
 
     // Check via db cron_jobs table if it is time to run job
     const job = await jobScheduler();
