@@ -22,10 +22,11 @@ export * from "./server/llm/types";
 
 // evals
 export * from "./features/evals/types";
-
+export * from "./features/evals/utilities";
 // table actions
 export * from "./features/batchExport/types";
 export * from "./features/batchAction/types";
+export { BatchTableNames } from "./interfaces/tableNames";
 
 // annotation
 export * from "./features/annotation/types";
@@ -54,6 +55,7 @@ export * from "./server/utils/metadata_conversion";
 export * from "./errors/index";
 
 export * from "./utils/environment";
+export * from "./interfaces/search";
 
 // domain
 export * from "./domain";

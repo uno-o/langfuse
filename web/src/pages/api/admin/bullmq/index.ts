@@ -1,5 +1,5 @@
 import { type NextApiRequest, type NextApiResponse } from "next";
-import { z } from "zod";
+import { z } from "zod/v4";
 import { logger, QueueName, getQueue } from "@langfuse/shared/src/server";
 import { AdminApiAuthService } from "@/src/features/admin-api/server/adminApiAuth";
 
@@ -40,7 +40,7 @@ export default async function handler(
       return;
     }
 
-    if (!AdminApiAuthService.handleAdminAuth(req, res)) {
+    if (!AdminApiAuthService.handleAdminAuth(req, res, false)) {
       return;
     }
 

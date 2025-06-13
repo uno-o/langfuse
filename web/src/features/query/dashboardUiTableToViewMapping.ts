@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { dashboardColumnDefinitions, singleFilter } from "@langfuse/shared";
 import { type views } from "@/src/features/query/types";
 
@@ -29,6 +29,10 @@ const viewMappings: Record<z.infer<typeof views>, Record<string, string>[]> = {
     {
       uiTableName: "Session",
       viewName: "sessionId",
+    },
+    {
+      uiTableName: "Metadata",
+      viewName: "metadata",
     },
     {
       uiTableName: "Release",
@@ -63,6 +67,10 @@ const viewMappings: Record<z.infer<typeof views>, Record<string, string>[]> = {
     {
       uiTableName: "Session",
       viewName: "sessionId",
+    },
+    {
+      uiTableName: "Metadata",
+      viewName: "metadata",
     },
     {
       uiTableName: "Type",
@@ -119,6 +127,10 @@ const viewMappings: Record<z.infer<typeof views>, Record<string, string>[]> = {
       viewName: "sessionId",
     },
     {
+      uiTableName: "Metadata",
+      viewName: "metadata",
+    },
+    {
       uiTableName: "Trace Name",
       viewName: "traceName",
     },
@@ -165,6 +177,10 @@ const viewMappings: Record<z.infer<typeof views>, Record<string, string>[]> = {
       viewName: "sessionId",
     },
     {
+      uiTableName: "Metadata",
+      viewName: "metadata",
+    },
+    {
       uiTableName: "Trace Name",
       viewName: "traceName",
     },
@@ -199,6 +215,12 @@ const isLegacyUiTableFilter = (
         uiTableId: "observationName",
         clickhouseTableName: "observations",
         clickhouseSelect: 'o."name"',
+      },
+      {
+        uiTableName: "Metadata",
+        uiTableId: "metadata",
+        clickhouseTableName: "traces",
+        clickhouseSelect: 't."metadata"',
       },
     ])
     .some((columnDef) => columnDef.uiTableName === filter.column);
