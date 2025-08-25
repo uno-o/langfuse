@@ -51,7 +51,7 @@ export const env = createEnv({
     LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: z.enum(["true", "false"]).optional(),
     SALT: z.string({
       required_error:
-        "A strong Salt is required to encrypt API keys securely. See: https://langfuse.com/docs/deployment/self-host#deploy-the-container",
+        "A strong Salt is required to encrypt API keys securely. See: https://langfuse.com/self-hosting#deploy-the-container",
     }),
     // Add newly signed up users to default org and/or project with role
     LANGFUSE_DEFAULT_ORG_ID: z.string().optional(),
@@ -198,23 +198,9 @@ export const env = createEnv({
       )
       .optional(),
 
-    REDIS_HOST: z.string().nullish(),
-    REDIS_PORT: z.coerce
-      .number({
-        description:
-          ".env files convert numbers to strings, therefore we have to enforce them to be numbers",
-      })
-      .positive()
-      .max(65536, `options.port should be >= 0 and < 65536`)
-      .default(6379)
-      .nullable(),
-    REDIS_AUTH: z.string().nullish(),
-    REDIS_CONNECTION_STRING: z.string().nullish(),
-    REDIS_ENABLE_AUTO_PIPELINING: z.enum(["true", "false"]).default("true"),
-
     // langfuse caching
-    LANGFUSE_CACHE_API_KEY_ENABLED: z.enum(["true", "false"]).default("false"),
-    LANGFUSE_CACHE_API_KEY_TTL_SECONDS: z.coerce.number().default(120),
+    LANGFUSE_CACHE_API_KEY_ENABLED: z.enum(["true", "false"]).default("true"),
+    LANGFUSE_CACHE_API_KEY_TTL_SECONDS: z.coerce.number().default(300),
 
     // Multimodal media upload to S3
     LANGFUSE_S3_MEDIA_MAX_CONTENT_LENGTH: z.coerce
@@ -263,7 +249,7 @@ export const env = createEnv({
     LANGFUSE_INIT_ORG_CLOUD_PLAN: z.string().optional(), // for use in CI
     LANGFUSE_INIT_PROJECT_ID: z.string().optional(),
     LANGFUSE_INIT_PROJECT_NAME: z.string().optional(),
-    LANGFUSE_INIT_PROJECT_RETENTION: z.number().int().gte(3).optional(),
+    LANGFUSE_INIT_PROJECT_RETENTION: z.coerce.number().int().gte(3).optional(),
     LANGFUSE_INIT_PROJECT_PUBLIC_KEY: z.string().optional(),
     LANGFUSE_INIT_PROJECT_SECRET_KEY: z.string().optional(),
     LANGFUSE_INIT_USER_EMAIL: z
@@ -271,7 +257,7 @@ export const env = createEnv({
       .optional(),
     LANGFUSE_INIT_USER_NAME: z.string().optional(),
     LANGFUSE_INIT_USER_PASSWORD: z.string().optional(),
-    LANGFUSE_MAX_HISTORIC_EVAL_CREATION_LIMIT: z
+    LANGFUSE_MAX_HISTORIC_EVAL_CREATION_LIMIT: z.coerce
       .number()
       .positive()
       .default(50_000),
@@ -283,6 +269,10 @@ export const env = createEnv({
     LANGFUSE_UI_VISIBLE_PRODUCT_MODULES: z.string().optional(),
     // UI customization - comma-separated list of hidden product modules
     LANGFUSE_UI_HIDDEN_PRODUCT_MODULES: z.string().optional(),
+
+    SLACK_CLIENT_ID: z.string().optional(),
+    SLACK_CLIENT_SECRET: z.string().optional(),
+    SLACK_STATE_SECRET: z.string().optional(),
   },
 
   /**
@@ -308,6 +298,10 @@ export const env = createEnv({
     NEXT_PUBLIC_PLAIN_APP_ID: z.string().optional(),
     NEXT_PUBLIC_BUILD_ID: z.string().optional(),
     NEXT_PUBLIC_BASE_PATH: z.string().optional(),
+    NEXT_PUBLIC_LANGFUSE_PLAYGROUND_STREAMING_ENABLED_DEFAULT: z
+      .enum(["true", "false"])
+      .optional()
+      .default("true"),
   },
 
   /**
@@ -507,15 +501,13 @@ export const env = createEnv({
       process.env.LANGFUSE_UI_VISIBLE_PRODUCT_MODULES,
     LANGFUSE_UI_HIDDEN_PRODUCT_MODULES:
       process.env.LANGFUSE_UI_HIDDEN_PRODUCT_MODULES,
+    // Playground
+    NEXT_PUBLIC_LANGFUSE_PLAYGROUND_STREAMING_ENABLED_DEFAULT:
+      process.env.NEXT_PUBLIC_LANGFUSE_PLAYGROUND_STREAMING_ENABLED_DEFAULT,
     // EE License
     LANGFUSE_EE_LICENSE_KEY: process.env.LANGFUSE_EE_LICENSE_KEY,
     ADMIN_API_KEY: process.env.ADMIN_API_KEY,
     ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
-    REDIS_HOST: process.env.REDIS_HOST,
-    REDIS_PORT: process.env.REDIS_PORT,
-    REDIS_AUTH: process.env.REDIS_AUTH,
-    REDIS_CONNECTION_STRING: process.env.REDIS_CONNECTION_STRING,
-    REDIS_ENABLE_AUTO_PIPELINING: process.env.REDIS_ENABLE_AUTO_PIPELINING,
     // langfuse caching
     LANGFUSE_CACHE_API_KEY_ENABLED: process.env.LANGFUSE_CACHE_API_KEY_ENABLED,
     LANGFUSE_CACHE_API_KEY_TTL_SECONDS:
@@ -548,6 +540,9 @@ export const env = createEnv({
     NEXT_PUBLIC_BASE_PATH: process.env.NEXT_PUBLIC_BASE_PATH,
     LANGFUSE_MAX_HISTORIC_EVAL_CREATION_LIMIT:
       process.env.LANGFUSE_MAX_HISTORIC_EVAL_CREATION_LIMIT,
+    SLACK_CLIENT_ID: process.env.SLACK_CLIENT_ID,
+    SLACK_CLIENT_SECRET: process.env.SLACK_CLIENT_SECRET,
+    SLACK_STATE_SECRET: process.env.SLACK_STATE_SECRET,
   },
   // Skip validation in Docker builds
   // DOCKER_BUILD is set in Dockerfile

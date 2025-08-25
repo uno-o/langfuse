@@ -1,5 +1,5 @@
 import { OtelIngestionProcessor } from "@/src/features/otel/server/OtelIngestionProcessor";
-import { ingestionEvent } from "@langfuse/shared/src/server";
+import { createIngestionEventSchema } from "@langfuse/shared/src/server";
 
 // Test helper function to maintain backward compatibility with existing tests
 // This mimics the old convertOtelSpanToIngestionEvent function signature
@@ -12,12 +12,12 @@ async function convertOtelSpanToIngestionEvent(
     projectId: "test-project",
     publicKey,
   });
-  
+
   // For tests, we bypass Redis initialization and directly set the seen traces
   // This is safe because we're testing the conversion logic, not the Redis caching
   (processor as any).seenTraces = seenTraces;
   (processor as any).isInitialized = true;
-  
+
   return await processor.processToIngestionEvents([resourceSpan]);
 }
 
@@ -256,9 +256,14 @@ describe("OTel Resource Span Mapping", () => {
         },
       ];
 
-      const events = (await Promise.all(langfuseOtelSpans.map(async (span) =>
-        await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
-      ))).flat();
+      const events = (
+        await Promise.all(
+          langfuseOtelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
+          ),
+        )
+      ).flat();
       const traceEvents = events.filter((e) => e.type === "trace-create");
       const generationEvents = events.filter(
         (e) => e.type === "generation-create",
@@ -449,9 +454,14 @@ describe("OTel Resource Span Mapping", () => {
         },
       ];
 
-      const events = (await Promise.all(langfuseOtelSpans.map(async (span) =>
-        await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
-      ))).flat();
+      const events = (
+        await Promise.all(
+          langfuseOtelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
+          ),
+        )
+      ).flat();
       const traceEvents = events.filter((e) => e.type === "trace-create");
       const spanEvents = events.filter((e) => e.type === "span-create");
 
@@ -476,7 +486,7 @@ describe("OTel Resource Span Mapping", () => {
       expect(traceEvent.body).toMatchObject({
         id: "95f3b926c7d009925bcb5dbc27311120",
         timestamp: "2025-05-05T13:42:33.936Z",
-        name: undefined,
+        name: "my-span-with-custom-trace-id",
         environment: "production",
       });
     });
@@ -567,9 +577,12 @@ describe("OTel Resource Span Mapping", () => {
       ];
 
       await expect(
-        Promise.all(langfuseOtelSpans.map(async (span) =>
-          await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
-        ))
+        Promise.all(
+          langfuseOtelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
+          ),
+        ),
       ).rejects.toThrowError("Langfuse OTEL SDK span has different public key");
     });
   });
@@ -758,9 +771,8 @@ describe("OTel Resource Span Mapping", () => {
 
       // Then
       // Will throw an error if the parsing fails
-      const parsedEvents = langfuseEvents.map((event) =>
-        ingestionEvent.parse(event),
-      );
+      const schema = createIngestionEventSchema();
+      const parsedEvents = langfuseEvents.map((event) => schema.parse(event));
       expect(parsedEvents).toHaveLength(2);
     });
 
@@ -877,9 +889,8 @@ describe("OTel Resource Span Mapping", () => {
 
       // Then
       // Will throw an error if the parsing fails
-      const parsedEvents = langfuseEvents.map((event) =>
-        ingestionEvent.parse(event),
-      );
+      const schema = createIngestionEventSchema();
+      const parsedEvents = langfuseEvents.map((event) => schema.parse(event));
       expect(parsedEvents).toHaveLength(2);
     });
 
@@ -998,9 +1009,8 @@ describe("OTel Resource Span Mapping", () => {
 
       // Then
       // Will throw an error if the parsing fails
-      const parsedEvents = langfuseEvents.map((event) =>
-        ingestionEvent.parse(event),
-      );
+      const schema = createIngestionEventSchema();
+      const parsedEvents = langfuseEvents.map((event) => schema.parse(event));
       expect(parsedEvents).toHaveLength(2);
 
       // Check that input contains both system and user messages
@@ -1087,7 +1097,164 @@ describe("OTel Resource Span Mapping", () => {
       expect(langfuseEvents).toHaveLength(2);
     });
 
-    it("should interpret openinference LLM calls as a generation", async () => {
+    it.each([
+      ["CHAIN", "chain-create"],
+      ["RETRIEVER", "retriever-create"],
+      ["LLM", "generation-create"],
+      ["EMBEDDING", "embedding-create"],
+      ["AGENT", "agent-create"],
+      ["TOOL", "tool-create"],
+      ["GUARDRAIL", "guardrail-create"],
+      ["EVALUATOR", "evaluator-create"],
+      ["", "span-create"],
+      ["UnknownKind", "span-create"],
+    ])(
+      "should map OpenInference %s span kind to %s event",
+      async (spanKind, expectedEventType) => {
+        const resourceSpan = {
+          scopeSpans: [
+            {
+              spans: [
+                {
+                  ...defaultSpanProps,
+                  attributes: [
+                    {
+                      key: "openinference.span.kind",
+                      value: { stringValue: spanKind },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+
+        // When
+        const langfuseEvents = await convertOtelSpanToIngestionEvent(
+          resourceSpan,
+          new Set(),
+        );
+
+        // Then
+        expect(langfuseEvents).toHaveLength(2); // Should create trace + observation
+        expect(
+          langfuseEvents.some((event) => event.type === expectedEventType),
+        ).toBe(true);
+
+        // Verify the observation has the correct type
+        const observationEvent = langfuseEvents.find(
+          (event) =>
+            event.type.endsWith("-create") && event.type !== "trace-create",
+        );
+        expect(observationEvent?.type).toBe(expectedEventType);
+      },
+    );
+
+    it.each([
+      ["chat", "generation-create"],
+      ["completion", "generation-create"],
+      ["generate_content", "generation-create"],
+      ["generate", "generation-create"],
+      ["embeddings", "embedding-create"],
+      ["invoke_agent", "agent-create"],
+      ["create_agent", "agent-create"],
+      ["execute_tool", "tool-create"],
+    ])(
+      "should map OTel GenAI %s operation to %s event",
+      async (operationName, expectedEventType) => {
+        const resourceSpan = {
+          scopeSpans: [
+            {
+              spans: [
+                {
+                  ...defaultSpanProps,
+                  attributes: [
+                    {
+                      key: "gen_ai.operation.name",
+                      value: { stringValue: operationName },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+
+        // When
+        const langfuseEvents = await convertOtelSpanToIngestionEvent(
+          resourceSpan,
+          new Set(),
+        );
+
+        // Then
+        expect(langfuseEvents).toHaveLength(2); // Should create trace + observation
+        expect(
+          langfuseEvents.some((event) => event.type === expectedEventType),
+        ).toBe(true);
+
+        // Verify the observation has the correct type
+        const observationEvent = langfuseEvents.find(
+          (event) =>
+            event.type.endsWith("-create") && event.type !== "trace-create",
+        );
+        expect(observationEvent?.type).toBe(expectedEventType);
+      },
+    );
+
+    it.each([
+      ["ai.generateText", "generation-create"],
+      ["ai.generateText.doGenerate", "generation-create"],
+      ["ai.streamText", "generation-create"],
+      ["ai.streamText.doStream", "generation-create"],
+      ["ai.generateObject", "generation-create"],
+      ["ai.generateObject.doGenerate", "generation-create"],
+      ["ai.streamObject", "generation-create"],
+      ["ai.streamObject.doStream", "generation-create"],
+      ["ai.embed", "embedding-create"],
+      ["ai.embed.doEmbed", "embedding-create"],
+      ["ai.embedMany", "embedding-create"],
+      ["ai.embedMany.doEmbed", "embedding-create"],
+      ["ai.toolCall", "tool-create"],
+    ])(
+      "should map AI SDK %s operation to %s event",
+      async (operationName, expectedEventType) => {
+        const resourceSpan = {
+          scopeSpans: [
+            {
+              spans: [
+                {
+                  ...defaultSpanProps,
+                  attributes: [
+                    {
+                      key: "operation.name",
+                      value: { stringValue: operationName },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+        // When
+        const langfuseEvents = await convertOtelSpanToIngestionEvent(
+          resourceSpan,
+          new Set(),
+        );
+        // Then
+        expect(langfuseEvents).toHaveLength(2); // Should create trace + observation
+        expect(
+          langfuseEvents.some((event) => event.type === expectedEventType),
+        ).toBe(true);
+        // Verify the observation has the correct type
+        const observationEvent = langfuseEvents.find(
+          (event) =>
+            event.type.endsWith("-create") && event.type !== "trace-create",
+        );
+        expect(observationEvent?.type).toBe(expectedEventType);
+      },
+    );
+
+    it("should prioritize OpenInference over OTel GenAI and model detection", async () => {
       const resourceSpan = {
         scopeSpans: [
           {
@@ -1097,7 +1264,15 @@ describe("OTel Resource Span Mapping", () => {
                 attributes: [
                   {
                     key: "openinference.span.kind",
-                    value: { stringValue: "LLM" },
+                    value: { stringValue: "TOOL" }, // Should be tool-create
+                  },
+                  {
+                    key: "gen_ai.operation.name", // Would normally trigger generation
+                    value: { stringValue: "chat" },
+                  },
+                  {
+                    key: "gen_ai.request.model", // Would normally trigger generation
+                    value: { stringValue: "gpt-4" },
                   },
                 ],
               },
@@ -1113,10 +1288,157 @@ describe("OTel Resource Span Mapping", () => {
       );
 
       // Then
-      // Check that we create a generation
+      expect(langfuseEvents).toHaveLength(2);
+      // Should be tool-create, NOT generation-create (OpenInference takes priority)
+      expect(langfuseEvents.some((event) => event.type === "tool-create")).toBe(
+        true,
+      );
       expect(
         langfuseEvents.some((event) => event.type === "generation-create"),
+      ).toBe(false);
+    });
+
+    it("should prioritize OTel GenAI over model-based detection", async () => {
+      const resourceSpan = {
+        scopeSpans: [
+          {
+            spans: [
+              {
+                ...defaultSpanProps,
+                attributes: [
+                  {
+                    key: "gen_ai.operation.name",
+                    value: { stringValue: "embeddings" }, // Should be embedding-create
+                  },
+                  {
+                    key: "gen_ai.request.model", // Would normally trigger generation
+                    value: { stringValue: "gpt-4" },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      // When
+      const langfuseEvents = await convertOtelSpanToIngestionEvent(
+        resourceSpan,
+        new Set(),
+      );
+
+      // Then
+      expect(langfuseEvents).toHaveLength(2);
+      // Should be embedding-create, NOT generation-create (OTel GenAI takes priority over model detection)
+      expect(
+        langfuseEvents.some((event) => event.type === "embedding-create"),
       ).toBe(true);
+      expect(
+        langfuseEvents.some((event) => event.type === "generation-create"),
+      ).toBe(false);
+    });
+
+    it("should trust Langfuse type over OpenInference or model detection", async () => {
+      const resourceSpan = {
+        scopeSpans: [
+          {
+            spans: [
+              {
+                ...defaultSpanProps,
+                attributes: [
+                  // Explicit Langfuse type (should always win)
+                  {
+                    key: "langfuse.observation.type",
+                    value: { stringValue: "span" },
+                  },
+                  // OpenInference span kind
+                  {
+                    key: "openinference.span.kind",
+                    value: { stringValue: "Agent" },
+                  },
+                  // Model indicators
+                  {
+                    key: "gen_ai.request.model",
+                    value: { stringValue: "gpt-4" },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      // When
+      const langfuseEvents = await convertOtelSpanToIngestionEvent(
+        resourceSpan,
+        new Set(),
+      );
+
+      // Then
+      expect(langfuseEvents).toHaveLength(2);
+      // Explicit Langfuse type should always win over inferred types
+      expect(langfuseEvents.some((event) => event.type === "span-create")).toBe(
+        true,
+      );
+      expect(
+        langfuseEvents.some((event) => event.type === "agent-create"),
+      ).toBe(false);
+      expect(
+        langfuseEvents.some((event) => event.type === "generation-create"),
+      ).toBe(false);
+    });
+
+    it("should trust OpenInference over model detection but keep model attributes", async () => {
+      const resourceSpan = {
+        scopeSpans: [
+          {
+            spans: [
+              {
+                ...defaultSpanProps,
+                attributes: [
+                  // OpenInference span kind (should take priority over model detection)
+                  {
+                    key: "openinference.span.kind",
+                    value: { stringValue: "RETRIEVER" },
+                  },
+                  // Model indicators (would be fallback)
+                  {
+                    key: "gen_ai.request.model",
+                    value: { stringValue: "text-embedding-ada-002" },
+                  },
+                  {
+                    key: "gen_ai.usage.input_tokens",
+                    value: { intValue: { low: 50, high: 0, unsigned: false } },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      // When
+      const langfuseEvents = await convertOtelSpanToIngestionEvent(
+        resourceSpan,
+        new Set(),
+      );
+
+      // Then
+      expect(langfuseEvents).toHaveLength(2);
+      // OpenInference should win over model detection
+      expect(
+        langfuseEvents.some((event) => event.type === "retriever-create"),
+      ).toBe(true);
+      expect(
+        langfuseEvents.some((event) => event.type === "generation-create"),
+      ).toBe(false);
+
+      // Should still extract model and usage info
+      const retrieverEvent = langfuseEvents.find(
+        (event) => event.type === "retriever-create",
+      );
+      expect(retrieverEvent?.body.model).toBe("text-embedding-ada-002");
+      expect(retrieverEvent?.body.usageDetails.input).toBe(50);
     });
 
     it("should use logfire.msg as span name", async () => {
@@ -1259,6 +1581,16 @@ describe("OTel Resource Span Mapping", () => {
           otelAttributeValue: { stringValue: "session-1" },
           entityAttributeKey: "sessionId",
           entityAttributeValue: "session-1",
+        },
+      ],
+      [
+        "should extract sessionId on trace from gen_ai.conversation.id",
+        {
+          entity: "trace",
+          otelAttributeKey: "gen_ai.conversation.id",
+          otelAttributeValue: { stringValue: "conversation-1" },
+          entityAttributeKey: "sessionId",
+          entityAttributeValue: "conversation-1",
         },
       ],
       [
@@ -2124,18 +2456,20 @@ describe("OTel Resource Span Mapping", () => {
 
   describe("Span Counting", () => {
     it("should count spans correctly across multiple resource spans", () => {
-      const processor = new OtelIngestionProcessor({ projectId: "test-project" });
-      
+      const processor = new OtelIngestionProcessor({
+        projectId: "test-project",
+      });
+
       const resourceSpans = [
         {
           scopeSpans: [
             { spans: [{}, {}, {}] }, // 3 spans
-            { spans: [{}] },         // 1 span
+            { spans: [{}] }, // 1 span
           ],
         },
         {
           scopeSpans: [
-            { spans: [{}, {}] },     // 2 spans
+            { spans: [{}, {}] }, // 2 spans
           ],
         },
       ];
@@ -2146,22 +2480,28 @@ describe("OTel Resource Span Mapping", () => {
     });
 
     it("should handle empty resource spans", () => {
-      const processor = new OtelIngestionProcessor({ projectId: "test-project" });
-      
+      const processor = new OtelIngestionProcessor({
+        projectId: "test-project",
+      });
+
       const count = (processor as any).getTotalSpanCount([]);
       expect(count).toBe(0);
     });
 
     it("should handle null/undefined resource spans", () => {
-      const processor = new OtelIngestionProcessor({ projectId: "test-project" });
-      
+      const processor = new OtelIngestionProcessor({
+        projectId: "test-project",
+      });
+
       expect((processor as any).getTotalSpanCount(null)).toBe(0);
       expect((processor as any).getTotalSpanCount(undefined)).toBe(0);
     });
 
     it("should handle malformed resource spans", () => {
-      const processor = new OtelIngestionProcessor({ projectId: "test-project" });
-      
+      const processor = new OtelIngestionProcessor({
+        projectId: "test-project",
+      });
+
       const resourceSpans = [
         { scopeSpans: null },
         { scopeSpans: undefined },
@@ -2181,16 +2521,20 @@ describe("OTel Resource Span Mapping", () => {
     });
 
     it("should return 0 for non-array input", () => {
-      const processor = new OtelIngestionProcessor({ projectId: "test-project" });
-      
+      const processor = new OtelIngestionProcessor({
+        projectId: "test-project",
+      });
+
       expect((processor as any).getTotalSpanCount("not-an-array")).toBe(0);
       expect((processor as any).getTotalSpanCount({})).toBe(0);
       expect((processor as any).getTotalSpanCount(123)).toBe(0);
     });
 
     it("should handle deeply nested null/undefined structures", () => {
-      const processor = new OtelIngestionProcessor({ projectId: "test-project" });
-      
+      const processor = new OtelIngestionProcessor({
+        projectId: "test-project",
+      });
+
       const resourceSpans = [
         null,
         undefined,
@@ -2208,8 +2552,10 @@ describe("OTel Resource Span Mapping", () => {
     });
 
     it("should return -1 and not throw on unexpected errors", () => {
-      const processor = new OtelIngestionProcessor({ projectId: "test-project" });
-      
+      const processor = new OtelIngestionProcessor({
+        projectId: "test-project",
+      });
+
       // Create a malicious object that throws when accessed
       const maliciousResourceSpan = {
         get scopeSpans() {
@@ -2217,7 +2563,9 @@ describe("OTel Resource Span Mapping", () => {
         },
       };
 
-      const count = (processor as any).getTotalSpanCount([maliciousResourceSpan]);
+      const count = (processor as any).getTotalSpanCount([
+        maliciousResourceSpan,
+      ]);
       expect(count).toBe(-1);
     });
   });
@@ -2243,8 +2591,10 @@ describe("OTel Resource Span Mapping", () => {
       const expectedEndTime = "2025-04-17T07:39:54.084Z";
 
       // Convert timestamps to ISO strings
-      const actualStartTime = OtelIngestionProcessor.convertNanoTimestampToISO(positiveTimestamp);
-      const actualEndTime = OtelIngestionProcessor.convertNanoTimestampToISO(negativeTimestamp);
+      const actualStartTime =
+        OtelIngestionProcessor.convertNanoTimestampToISO(positiveTimestamp);
+      const actualEndTime =
+        OtelIngestionProcessor.convertNanoTimestampToISO(negativeTimestamp);
 
       // Verify conversions match expected values
       expect(actualStartTime).toBe(expectedStartTime);
@@ -2255,9 +2605,9 @@ describe("OTel Resource Span Mapping", () => {
       // Test with string timestamp (nanoseconds)
       const stringTimestamp = "1744317592317227000"; // Same as positiveTimestamp above
       const expectedStringResult = "2025-04-10T20:39:52.317Z";
-      expect(OtelIngestionProcessor.convertNanoTimestampToISO(stringTimestamp)).toBe(
-        expectedStringResult,
-      );
+      expect(
+        OtelIngestionProcessor.convertNanoTimestampToISO(stringTimestamp),
+      ).toBe(expectedStringResult);
 
       // Test with zero timestamp
       const zeroTimestamp = {
@@ -2265,9 +2615,9 @@ describe("OTel Resource Span Mapping", () => {
         high: 0,
         unsigned: true,
       };
-      expect(OtelIngestionProcessor.convertNanoTimestampToISO(zeroTimestamp)).toBe(
-        "1970-01-01T00:00:00.000Z",
-      );
+      expect(
+        OtelIngestionProcessor.convertNanoTimestampToISO(zeroTimestamp),
+      ).toBe("1970-01-01T00:00:00.000Z");
     });
   });
 
@@ -2295,10 +2645,13 @@ describe("OTel Resource Span Mapping", () => {
                 {
                   traceId: {
                     type: "Buffer",
-                    data: [149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39, 49, 17, 32],
+                    data: [
+                      149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39,
+                      49, 17, 32,
+                    ],
                   },
                   spanId: {
-                    type: "Buffer", 
+                    type: "Buffer",
                     data: [212, 62, 55, 183, 209, 126, 84, 118],
                   },
                   parentSpanId: {
@@ -2332,7 +2685,14 @@ describe("OTel Resource Span Mapping", () => {
       ];
 
       // Empty seenTraces set - should create shallow trace for first span
-      const events = (await Promise.all(otelSpans.map(async (span) => await convertOtelSpanToIngestionEvent(span, new Set(), publicKey)))).flat();
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
+          ),
+        )
+      ).flat();
 
       const traceEvents = events.filter((e) => e.type === "trace-create");
       const spanEvents = events.filter((e) => e.type === "span-create");
@@ -2342,7 +2702,7 @@ describe("OTel Resource Span Mapping", () => {
       expect(spanEvents.length).toBe(1);
 
       const traceEvent = traceEvents[0];
-      
+
       // Should create shallow trace with minimal information
       expect(traceEvent.body).toMatchObject({
         id: "95f3b926c7d009925bcb5dbc27311120",
@@ -2381,7 +2741,10 @@ describe("OTel Resource Span Mapping", () => {
                 {
                   traceId: {
                     type: "Buffer",
-                    data: [149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39, 49, 17, 32],
+                    data: [
+                      149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39,
+                      49, 17, 32,
+                    ],
                   },
                   spanId: {
                     type: "Buffer",
@@ -2418,14 +2781,25 @@ describe("OTel Resource Span Mapping", () => {
       ];
 
       // seenTraces contains the traceId - should NOT create trace
-      const events = (await Promise.all(otelSpans.map(async (span) => await convertOtelSpanToIngestionEvent(span, seenTraces, publicKey)))).flat();
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(
+                span,
+                seenTraces,
+                publicKey,
+              ),
+          ),
+        )
+      ).flat();
 
       const traceEvents = events.filter((e) => e.type === "trace-create");
       const spanEvents = events.filter((e) => e.type === "span-create");
 
       expect(events.length).toBe(1);
       expect(traceEvents.length).toBe(0); // No trace should be created
-      expect(spanEvents.length).toBe(1);   // Only span should be created
+      expect(spanEvents.length).toBe(1); // Only span should be created
 
       const spanEvent = spanEvents[0];
       expect(spanEvent.body).toMatchObject({
@@ -2460,7 +2834,10 @@ describe("OTel Resource Span Mapping", () => {
                 {
                   traceId: {
                     type: "Buffer",
-                    data: [149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39, 49, 17, 32],
+                    data: [
+                      149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39,
+                      49, 17, 32,
+                    ],
                   },
                   spanId: {
                     type: "Buffer",
@@ -2494,7 +2871,18 @@ describe("OTel Resource Span Mapping", () => {
       ];
 
       // seenTraces contains the traceId, but span is root - should still create full trace
-      const events = (await Promise.all(otelSpans.map(async (span) => await convertOtelSpanToIngestionEvent(span, seenTraces, publicKey)))).flat();
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(
+                span,
+                seenTraces,
+                publicKey,
+              ),
+          ),
+        )
+      ).flat();
 
       const traceEvents = events.filter((e) => e.type === "trace-create");
       const spanEvents = events.filter((e) => e.type === "span-create");
@@ -2504,7 +2892,7 @@ describe("OTel Resource Span Mapping", () => {
       expect(spanEvents.length).toBe(1);
 
       const traceEvent = traceEvents[0];
-      
+
       // Should create full trace with name and metadata since it's a root span
       expect(traceEvent.body).toMatchObject({
         id: "95f3b926c7d009925bcb5dbc27311120",
@@ -2514,6 +2902,188 @@ describe("OTel Resource Span Mapping", () => {
       });
 
       expect(traceEvent.body.metadata).toBeDefined();
+    });
+
+    it("should create trace-create event when span has trace_metadata with user_id, session_id, and tags", async () => {
+      const traceId = "95f3b926c7d009925bcb5dbc27311120";
+      const seenTraces = new Set([traceId]);
+
+      const otelSpans = [
+        {
+          resource: {
+            attributes: [
+              {
+                key: "service.name",
+                value: { stringValue: "test-service" },
+              },
+            ],
+          },
+          scopeSpans: [
+            {
+              scope: {
+                name: "test-scope",
+                version: "1.0.0",
+              },
+              spans: [
+                {
+                  traceId: {
+                    type: "Buffer",
+                    data: [
+                      149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39,
+                      49, 17, 32,
+                    ],
+                  },
+                  spanId: {
+                    type: "Buffer",
+                    data: [212, 62, 55, 183, 209, 126, 84, 118],
+                  },
+                  parentSpanId: {
+                    type: "Buffer",
+                    data: [131, 78, 40, 181, 145, 127, 190, 246],
+                  },
+                  name: "child-span",
+                  kind: 1,
+                  startTimeUnixNano: {
+                    low: 1047784088,
+                    high: 406627672,
+                    unsigned: true,
+                  },
+                  endTimeUnixNano: {
+                    low: 1047784088,
+                    high: 406627672,
+                    unsigned: true,
+                  },
+                  attributes: [
+                    {
+                      key: "langfuse.trace.metadata.langfuse_user_id",
+                      value: { stringValue: "user-123" },
+                    },
+                    {
+                      key: "langfuse.trace.metadata.langfuse_session_id",
+                      value: { stringValue: "session-456" },
+                    },
+                    {
+                      key: "langfuse.trace.metadata.langfuse_tags",
+                      value: { stringValue: "tag1,tag2" },
+                    },
+                  ],
+                  status: {},
+                },
+              ],
+            },
+          ],
+        },
+      ];
+
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(
+                span,
+                seenTraces,
+                publicKey,
+              ),
+          ),
+        )
+      ).flat();
+
+      const traceEvents = events.filter((e) => e.type === "trace-create");
+      expect(traceEvents.length).toBe(1);
+      expect(traceEvents[0].body.userId).toBe("user-123");
+      expect(traceEvents[0].body.sessionId).toBe("session-456");
+      expect(traceEvents[0].body.tags).toEqual(["tag1", "tag2"]);
+    });
+
+    it("should create trace-create event when span has observation_metadata with user_id, session_id, and tags", async () => {
+      const traceId = "95f3b926c7d009925bcb5dbc27311120";
+      const seenTraces = new Set([traceId]);
+
+      const otelSpans = [
+        {
+          resource: {
+            attributes: [
+              {
+                key: "service.name",
+                value: { stringValue: "test-service" },
+              },
+            ],
+          },
+          scopeSpans: [
+            {
+              scope: {
+                name: "test-scope",
+                version: "1.0.0",
+              },
+              spans: [
+                {
+                  traceId: {
+                    type: "Buffer",
+                    data: [
+                      149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39,
+                      49, 17, 32,
+                    ],
+                  },
+                  spanId: {
+                    type: "Buffer",
+                    data: [212, 62, 55, 183, 209, 126, 84, 118],
+                  },
+                  parentSpanId: {
+                    type: "Buffer",
+                    data: [131, 78, 40, 181, 145, 127, 190, 246],
+                  },
+                  name: "child-span",
+                  kind: 1,
+                  startTimeUnixNano: {
+                    low: 1047784088,
+                    high: 406627672,
+                    unsigned: true,
+                  },
+                  endTimeUnixNano: {
+                    low: 1047784088,
+                    high: 406627672,
+                    unsigned: true,
+                  },
+                  attributes: [
+                    {
+                      key: "langfuse.observation.metadata.langfuse_user_id",
+                      value: { stringValue: "user-789" },
+                    },
+                    {
+                      key: "langfuse.observation.metadata.langfuse_session_id",
+                      value: { stringValue: "session-abc" },
+                    },
+                    {
+                      key: "langfuse.observation.metadata.langfuse_tags",
+                      value: { stringValue: "tag3,tag4" },
+                    },
+                  ],
+                  status: {},
+                },
+              ],
+            },
+          ],
+        },
+      ];
+
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(
+                span,
+                seenTraces,
+                publicKey,
+              ),
+          ),
+        )
+      ).flat();
+
+      const traceEvents = events.filter((e) => e.type === "trace-create");
+      expect(traceEvents.length).toBe(1);
+      expect(traceEvents[0].body.userId).toBe("user-789");
+      expect(traceEvents[0].body.sessionId).toBe("session-abc");
+      expect(traceEvents[0].body.tags).toEqual(["tag3", "tag4"]);
     });
 
     it("should create full trace for span with trace updates even when seenTraces contains traceId", async () => {
@@ -2540,7 +3110,10 @@ describe("OTel Resource Span Mapping", () => {
                 {
                   traceId: {
                     type: "Buffer",
-                    data: [149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39, 49, 17, 32],
+                    data: [
+                      149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39,
+                      49, 17, 32,
+                    ],
                   },
                   spanId: {
                     type: "Buffer",
@@ -2581,7 +3154,18 @@ describe("OTel Resource Span Mapping", () => {
       ];
 
       // seenTraces contains the traceId, but span has trace updates - should still create full trace
-      const events = (await Promise.all(otelSpans.map(async (span) => await convertOtelSpanToIngestionEvent(span, seenTraces, publicKey)))).flat();
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(
+                span,
+                seenTraces,
+                publicKey,
+              ),
+          ),
+        )
+      ).flat();
 
       const traceEvents = events.filter((e) => e.type === "trace-create");
       const spanEvents = events.filter((e) => e.type === "span-create");
@@ -2591,7 +3175,7 @@ describe("OTel Resource Span Mapping", () => {
       expect(spanEvents.length).toBe(1);
 
       const traceEvent = traceEvents[0];
-      
+
       // Should create full trace with trace updates
       expect(traceEvent.body).toMatchObject({
         id: "95f3b926c7d009925bcb5dbc27311120",
@@ -2605,7 +3189,9 @@ describe("OTel Resource Span Mapping", () => {
     });
 
     it("should create only ONE trace when multiple spans share the same traceId with empty seenTraces", async () => {
-      const sharedTraceId = [149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39, 49, 17, 32];
+      const sharedTraceId = [
+        149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39, 49, 17, 32,
+      ];
 
       const otelSpans = [
         {
@@ -2730,7 +3316,14 @@ describe("OTel Resource Span Mapping", () => {
       ];
 
       // Empty seenTraces set - should create only ONE trace despite multiple spans with same traceId
-      const events = (await Promise.all(otelSpans.map(async (span) => await convertOtelSpanToIngestionEvent(span, new Set(), publicKey)))).flat();
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
+          ),
+        )
+      ).flat();
 
       const traceEvents = events.filter((e) => e.type === "trace-create");
       const spanEvents = events.filter((e) => e.type === "span-create");
@@ -2740,7 +3333,7 @@ describe("OTel Resource Span Mapping", () => {
       expect(spanEvents.length).toBe(3); // All three spans should be created
 
       const traceEvent = traceEvents[0];
-      
+
       // Should create shallow trace with minimal information (from first span processed)
       expect(traceEvent.body).toMatchObject({
         id: "95f3b926c7d009925bcb5dbc27311120",
@@ -2760,7 +3353,9 @@ describe("OTel Resource Span Mapping", () => {
     });
 
     it("should filter out shallow traces when full traces exist for the same traceId in same batch", async () => {
-      const sharedTraceId = [149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39, 49, 17, 32];
+      const sharedTraceId = [
+        149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39, 49, 17, 32,
+      ];
 
       const otelSpans = [
         {
@@ -2841,7 +3436,14 @@ describe("OTel Resource Span Mapping", () => {
       ];
 
       // Empty seenTraces set - both spans would normally create traces
-      const events = (await Promise.all(otelSpans.map(async (span) => await convertOtelSpanToIngestionEvent(span, new Set(), publicKey)))).flat();
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
+          ),
+        )
+      ).flat();
 
       const traceEvents = events.filter((e) => e.type === "trace-create");
       const spanEvents = events.filter((e) => e.type === "span-create");
@@ -2851,7 +3453,7 @@ describe("OTel Resource Span Mapping", () => {
       expect(spanEvents.length).toBe(2); // Both spans should be created
 
       const traceEvent = traceEvents[0];
-      
+
       // Should be the FULL trace (from root span), not the shallow one
       expect(traceEvent.body).toMatchObject({
         id: "95f3b926c7d009925bcb5dbc27311120",
@@ -2865,6 +3467,451 @@ describe("OTel Resource Span Mapping", () => {
       // Verify both spans were created
       expect(spanEvents[0].body.name).toBe("child-span");
       expect(spanEvents[1].body.name).toBe("root-span");
+    });
+
+    it("should prioritize langfuse.session.id over gen_ai.conversation.id when both are present", async () => {
+      const otelSpans = [
+        {
+          resource: {
+            attributes: [
+              {
+                key: "service.name",
+                value: { stringValue: "test-service" },
+              },
+            ],
+          },
+          scopeSpans: [
+            {
+              scope: {
+                name: "test-scope",
+                version: "1.0.0",
+              },
+              spans: [
+                {
+                  traceId: {
+                    type: "Buffer",
+                    data: [
+                      149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39,
+                      49, 17, 32,
+                    ],
+                  },
+                  spanId: {
+                    type: "Buffer",
+                    data: [212, 62, 55, 183, 209, 126, 84, 118],
+                  },
+                  name: "root-span",
+                  kind: 1,
+                  startTimeUnixNano: {
+                    low: 1047784088,
+                    high: 406627672,
+                    unsigned: true,
+                  },
+                  endTimeUnixNano: {
+                    low: 1149405088,
+                    high: 406627672,
+                    unsigned: true,
+                  },
+                  attributes: [
+                    {
+                      key: "langfuse.session.id",
+                      value: { stringValue: "langfuse-session-123" },
+                    },
+                    {
+                      key: "gen_ai.conversation.id",
+                      value: { stringValue: "otel-conversation-456" },
+                    },
+                  ],
+                  status: {},
+                },
+              ],
+            },
+          ],
+        },
+      ];
+
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
+          ),
+        )
+      ).flat();
+
+      const traceEvent = events.find((e) => e.type === "trace-create");
+      expect(traceEvent).toBeDefined();
+      expect(traceEvent.body.sessionId).toBe("langfuse-session-123");
+    });
+
+    it("should prioritize session.id over gen_ai.conversation.id when both are present", async () => {
+      const otelSpans = [
+        {
+          resource: {
+            attributes: [
+              {
+                key: "service.name",
+                value: { stringValue: "test-service" },
+              },
+            ],
+          },
+          scopeSpans: [
+            {
+              scope: {
+                name: "test-scope",
+                version: "1.0.0",
+              },
+              spans: [
+                {
+                  traceId: {
+                    type: "Buffer",
+                    data: [
+                      149, 243, 185, 38, 199, 208, 9, 146, 91, 203, 93, 188, 39,
+                      49, 17, 32,
+                    ],
+                  },
+                  spanId: {
+                    type: "Buffer",
+                    data: [212, 62, 55, 183, 209, 126, 84, 118],
+                  },
+                  name: "root-span",
+                  kind: 1,
+                  startTimeUnixNano: {
+                    low: 1047784088,
+                    high: 406627672,
+                    unsigned: true,
+                  },
+                  endTimeUnixNano: {
+                    low: 1149405088,
+                    high: 406627672,
+                    unsigned: true,
+                  },
+                  attributes: [
+                    {
+                      key: "session.id",
+                      value: { stringValue: "session-id-123" },
+                    },
+                    {
+                      key: "gen_ai.conversation.id",
+                      value: { stringValue: "otel-conversation-456" },
+                    },
+                  ],
+                  status: {},
+                },
+              ],
+            },
+          ],
+        },
+      ];
+
+      const events = (
+        await Promise.all(
+          otelSpans.map(
+            async (span) =>
+              await convertOtelSpanToIngestionEvent(span, new Set(), publicKey),
+          ),
+        )
+      ).flat();
+
+      const traceEvent = events.find((e) => e.type === "trace-create");
+      expect(traceEvent).toBeDefined();
+      expect(traceEvent.body.sessionId).toBe("session-id-123");
+    });
+
+    it("should default to span-create for unknown observation type", async () => {
+      const otelSpans = [
+        {
+          resource: { attributes: [] },
+          scopeSpans: [
+            {
+              scope: { name: "test-scope" },
+              spans: [
+                {
+                  traceId: {
+                    data: [
+                      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                    ],
+                  },
+                  spanId: { data: [1, 2, 3, 4, 5, 6, 7, 8] },
+                  name: "test-span",
+                  startTimeUnixNano: 1000000000,
+                  endTimeUnixNano: 2000000000,
+                  attributes: [
+                    {
+                      key: "langfuse.observation.type",
+                      value: { stringValue: "invalid_type" },
+                    },
+                  ],
+                  status: {},
+                },
+              ],
+            },
+          ],
+        },
+      ];
+
+      const events = await convertOtelSpanToIngestionEvent(
+        otelSpans[0],
+        new Set(),
+        publicKey,
+      );
+      const spanEvents = events.filter((e) => e.type === "span-create");
+
+      expect(spanEvents.length).toBe(1);
+      expect(spanEvents[0].body.name).toBe("test-span");
+    });
+
+    it("should respect explicit observation types", async () => {
+      // Test that explicit observation types (agent, evaluator, etc.) are respected
+      // even when spans have generation-like properties (e.g., model names)
+      const observationTypes = [
+        { type: "agent", expectedEventType: "agent-create" },
+        { type: "evaluator", expectedEventType: "evaluator-create" },
+        { type: "tool", expectedEventType: "tool-create" },
+        { type: "retriever", expectedEventType: "retriever-create" },
+        { type: "embedding", expectedEventType: "embedding-create" },
+        { type: "guardrail", expectedEventType: "guardrail-create" },
+      ];
+
+      for (const { type, expectedEventType } of observationTypes) {
+        const otelSpans = [
+          {
+            resource: { attributes: [] },
+            scopeSpans: [
+              {
+                scope: { name: "test-scope" },
+                spans: [
+                  {
+                    traceId: {
+                      data: [
+                        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                      ],
+                    },
+                    spanId: { data: [1, 2, 3, 4, 5, 6, 7, 8] },
+                    name: `test-${type}`,
+                    startTimeUnixNano: 1000000000,
+                    endTimeUnixNano: 2000000000,
+                    attributes: [
+                      {
+                        key: "langfuse.observation.type",
+                        value: { stringValue: type },
+                      },
+                      // Add model name to trigger generation heuristic
+                      {
+                        key: "langfuse.observation.model.name",
+                        value: { stringValue: "gpt-4" },
+                      },
+                      // Add other generation-like properties
+                      {
+                        key: "gen_ai.request.model",
+                        value: { stringValue: "gpt-4" },
+                      },
+                      {
+                        key: "openinference.span.kind",
+                        value: { stringValue: "LLM" },
+                      },
+                    ],
+                    status: {},
+                  },
+                ],
+              },
+            ],
+          },
+        ];
+
+        const events = await convertOtelSpanToIngestionEvent(
+          otelSpans[0],
+          new Set(),
+          publicKey,
+        );
+
+        // Should create the specific observation type, NOT generation-create
+        const observationEvents = events.filter(
+          (e) => e.type === expectedEventType,
+        );
+        const generationEvents = events.filter(
+          (e) => e.type === "generation-create",
+        );
+
+        expect(observationEvents.length).toBe(1);
+        expect(generationEvents.length).toBe(0);
+        expect(observationEvents[0].body.name).toBe(`test-${type}`);
+        expect(observationEvents[0].body.model).toBe("gpt-4");
+      }
+    });
+
+    it("should fall back to generation-create for model names without explicit type", async () => {
+      // Ensure model name heuristic still works when no explicit type is provided
+      const otelSpans = [
+        {
+          resource: { attributes: [] },
+          scopeSpans: [
+            {
+              scope: { name: "test-scope" },
+              spans: [
+                {
+                  traceId: {
+                    data: [
+                      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                    ],
+                  },
+                  spanId: { data: [1, 2, 3, 4, 5, 6, 7, 8] },
+                  name: "test-llm-call",
+                  startTimeUnixNano: 1000000000,
+                  endTimeUnixNano: 2000000000,
+                  attributes: [
+                    // No explicit observation type
+                    {
+                      key: "langfuse.observation.model.name",
+                      value: { stringValue: "gpt-4" },
+                    },
+                  ],
+                  status: {},
+                },
+              ],
+            },
+          ],
+        },
+      ];
+
+      const events = await convertOtelSpanToIngestionEvent(
+        otelSpans[0],
+        new Set(),
+        publicKey,
+      );
+
+      const generationEvents = events.filter(
+        (e) => e.type === "generation-create",
+      );
+      expect(generationEvents.length).toBe(1);
+      expect(generationEvents[0].body.name).toBe("test-llm-call");
+      expect(generationEvents[0].body.model).toBe("gpt-4");
+    });
+
+    it("should default to span-create when no mapper can handle the attributes", async () => {
+      const otelSpans = [
+        {
+          resource: { attributes: [] },
+          scopeSpans: [
+            {
+              scope: { name: "test-scope" },
+              spans: [
+                {
+                  traceId: {
+                    data: [
+                      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                    ],
+                  },
+                  spanId: {
+                    data: [1, 2, 3, 4, 5, 6, 7, 8],
+                  },
+                  name: "unknown-operation",
+                  startTimeUnixNano: 1000000000,
+                  endTimeUnixNano: 2000000000,
+                  attributes: [
+                    // No openinference.span.kind, no model indicators, no explicit type
+                    {
+                      key: "custom.attribute",
+                      value: { stringValue: "some-value" },
+                    },
+                    {
+                      key: "service.name",
+                      value: { stringValue: "my-service" },
+                    },
+                    {
+                      key: "operation.type",
+                      value: { stringValue: "unknown" },
+                    },
+                  ],
+                  status: {},
+                },
+              ],
+            },
+          ],
+        },
+      ];
+
+      const events = await convertOtelSpanToIngestionEvent(
+        otelSpans[0],
+        new Set(),
+        publicKey,
+      );
+
+      // Should create a span-create event (default when no mapping found)
+      const spanEvents = events.filter((e) => e.type === "span-create");
+      expect(spanEvents.length).toBe(1);
+      expect(spanEvents[0].body.name).toBe("unknown-operation");
+
+      // Should not create any generation-create or other typed events
+      const nonSpanEvents = events.filter(
+        (e) => e.type !== "span-create" && e.type !== "trace-create",
+      );
+      expect(nonSpanEvents.length).toBe(0);
+
+      // Should still create a trace
+      const traceEvents = events.filter((e) => e.type === "trace-create");
+      expect(traceEvents.length).toBe(1);
+    });
+
+    it("should override the observation type if it is declared as 'span' but holds generation-like attributes", async () => {
+      // Issue: https://github.com/langfuse/langfuse/issues/8682
+      const otelSpans = [
+        {
+          resource: { attributes: [] },
+          scopeSpans: [
+            {
+              scope: { name: "test-scope" },
+              spans: [
+                {
+                  traceId: {
+                    data: [
+                      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                    ],
+                  },
+                  spanId: {
+                    data: [1, 2, 3, 4, 5, 6, 7, 8],
+                  },
+                  name: "unknown-operation",
+                  startTimeUnixNano: 1000000000,
+                  endTimeUnixNano: 2000000000,
+                  attributes: [
+                    // No openinference.span.kind, no model indicators, no explicit type
+                    {
+                      key: "langfuse.observation.type",
+                      value: { stringValue: "span" },
+                    },
+                    {
+                      key: "langfuse.observation.model.name",
+                      value: { stringValue: "gpt-4o" },
+                    },
+                  ],
+                  status: {},
+                },
+              ],
+            },
+          ],
+        },
+      ];
+
+      const events = await convertOtelSpanToIngestionEvent(
+        otelSpans[0],
+        new Set(),
+        publicKey,
+      );
+
+      // Should create a span-create event (default when no mapping found)
+      const spanEvents = events.filter((e) => e.type === "generation-create");
+      expect(spanEvents.length).toBe(1);
+      expect(spanEvents[0].body.name).toBe("unknown-operation");
+
+      // Should not create any span-create or other typed events
+      const nonSpanEvents = events.filter(
+        (e) => e.type !== "generation-create" && e.type !== "trace-create",
+      );
+      expect(nonSpanEvents.length).toBe(0);
+
+      // Should still create a trace
+      const traceEvents = events.filter((e) => e.type === "trace-create");
+      expect(traceEvents.length).toBe(1);
     });
   });
 });

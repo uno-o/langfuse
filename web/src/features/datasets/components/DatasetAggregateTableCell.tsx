@@ -2,7 +2,7 @@ import DiffViewer from "@/src/components/DiffViewer";
 import { ScoresTableCell } from "@/src/components/scores-table-cell";
 import { Badge } from "@/src/components/ui/badge";
 import { Button } from "@/src/components/ui/button";
-import { IOTableCell } from "@/src/components/ui/CodeJsonViewer";
+import { IOTableCell } from "@/src/components/ui/IOTableCell";
 import {
   Dialog,
   DialogBody,
@@ -12,10 +12,8 @@ import {
 } from "@/src/components/ui/dialog";
 import { DialogTrigger } from "@/src/components/ui/dialog";
 import { DialogContent } from "@/src/components/ui/dialog";
-import {
-  type DatasetRunMetric,
-  type RunMetrics,
-} from "@/src/features/datasets/components/DatasetCompareRunsTable";
+import { type RunMetrics } from "@/src/features/datasets/components/DatasetCompareRunsTable";
+import { useDatasetCompareMetrics } from "@/src/features/datasets/contexts/DatasetCompareMetricsContext";
 import { api } from "@/src/utils/api";
 import { formatIntervalSeconds } from "@/src/utils/dates";
 import { cn } from "@/src/utils/tailwind";
@@ -36,19 +34,18 @@ const DatasetAggregateCell = ({
   projectId,
   observationId,
   scoreKeyToDisplayName,
-  selectedMetrics,
   actionButtons,
   output,
   isHighlighted = false,
 }: RunMetrics & {
   projectId: string;
   scoreKeyToDisplayName: Map<string, string>;
-  selectedMetrics: DatasetRunMetric[];
   actionButtons?: ReactNode;
   output?: Prisma.JsonValue;
   isHighlighted?: boolean;
 }) => {
   const [isOpen, setIsOpen] = useState(false);
+  const { selectedMetrics } = useDatasetCompareMetrics();
   // conditionally fetch the trace or observation depending on the presence of observationId
   const trace = api.traces.byId.useQuery(
     { traceId, projectId },
@@ -63,7 +60,6 @@ const DatasetAggregateCell = ({
       refetchOnWindowFocus: false,
       refetchOnReconnect: false,
       staleTime: Infinity,
-      onError: () => {},
     },
   );
   const observation = api.observations.byId.useQuery(
@@ -83,7 +79,6 @@ const DatasetAggregateCell = ({
       refetchOnWindowFocus: false,
       refetchOnReconnect: false,
       staleTime: Infinity,
-      onError: () => {},
     },
   );
 
@@ -239,7 +234,6 @@ export const DatasetAggregateTableCell = ({
   value,
   projectId,
   scoreKeyToDisplayName,
-  selectedMetrics,
   actionButtons,
   output,
   isHighlighted = false,
@@ -247,7 +241,6 @@ export const DatasetAggregateTableCell = ({
   value: RunMetrics;
   projectId: string;
   scoreKeyToDisplayName: Map<string, string>;
-  selectedMetrics: DatasetRunMetric[];
   actionButtons?: ReactNode;
   output?: Prisma.JsonValue;
   isHighlighted?: boolean;
@@ -257,7 +250,6 @@ export const DatasetAggregateTableCell = ({
       projectId={projectId}
       {...value}
       scoreKeyToDisplayName={scoreKeyToDisplayName}
-      selectedMetrics={selectedMetrics}
       actionButtons={actionButtons}
       output={output}
       isHighlighted={isHighlighted}

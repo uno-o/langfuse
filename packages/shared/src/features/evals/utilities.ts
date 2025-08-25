@@ -1,4 +1,5 @@
 import z from "zod/v4";
+import { JSONPath } from "jsonpath-plus";
 import { variableMapping } from "./types";
 
 /**
@@ -26,41 +27,77 @@ export const parseUnknownToString = (value: unknown): string => {
   return String(value);
 };
 
-function parseJsonDefault(selectedColumn: unknown, jsonSelector: string) {
-  // Front-end friendly JSON path extraction
-  const parsedJson =
-    typeof selectedColumn === "string"
-      ? JSON.parse(selectedColumn)
-      : selectedColumn;
+/**
+ * Recursively parses JSON strings that may have been encoded multiple times.
+ * This handles cases where data has been JSON.stringify'd multiple times.
+ *
+ * @param value - The potentially multi-encoded JSON string
+ * @returns The final parsed object or the original value if parsing fails
+ */
+function parseMultiEncodedJson(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
 
-  // Simple path extraction (could use a library)
-  return jsonSelector
-    .split(".")
-    .reduce((o, key) => (o as any)?.[key], parsedJson);
+  try {
+    const parsed = JSON.parse(value);
+
+    // If result is still a string, it might be double-encoded - recurse
+    if (typeof parsed === "string") {
+      return parseMultiEncodedJson(parsed);
+    }
+
+    return parsed;
+  } catch {
+    // If parsing fails, return original value
+    return value;
+  }
+}
+
+function parseJsonDefault(selectedColumn: unknown, jsonSelector: string) {
+  // selectedColumn should already be preprocessed by preprocessObjectWithJsonFields
+  // so we can directly use it with JSONPath
+  const result = JSONPath({
+    path: jsonSelector,
+    json: selectedColumn as any, // JSONPath accepts unknown but types are strict
+  });
+
+  return Array.isArray(result) && result.length > 0 ? result[0] : undefined;
 }
 
 export function extractValueFromObject(
   obj: Record<string, unknown>,
   mapping: z.infer<typeof variableMapping>,
-  parseJson?: (selectedColumn: unknown, jsonSelector: string) => unknown,
-): string {
-  const selectedColumn = obj[mapping.selectedColumnId];
+  parseJson?: (selectedColumn: unknown, jsonSelector: string) => unknown, // eslint-disable-line no-unused-vars
+): { value: string; error: Error | null } {
+  let selectedColumn = obj[mapping.selectedColumnId];
+
+  // Simple preprocessing: attempt to parse to valid JSON object
+  if (typeof selectedColumn === "string") {
+    selectedColumn = parseMultiEncodedJson(selectedColumn);
+  }
+
   const jsonParser = parseJson || parseJsonDefault;
 
   let jsonSelectedColumn;
+  let error: Error | null = null;
+
   if (mapping.jsonSelector && selectedColumn) {
     try {
       jsonSelectedColumn = jsonParser(selectedColumn, mapping.jsonSelector);
-    } catch (error) {
-      console.error(
-        `Error parsing JSON selector: ${mapping.jsonSelector}`,
-        error,
-      );
-      jsonSelectedColumn = selectedColumn;
+    } catch (err) {
+      error =
+        err instanceof Error
+          ? err
+          : new Error("There was an unknown error parsing the JSON");
+      jsonSelectedColumn = selectedColumn; // Fallback to original value
     }
   } else {
     jsonSelectedColumn = selectedColumn;
   }
 
-  return parseUnknownToString(jsonSelectedColumn);
+  return {
+    value: parseUnknownToString(jsonSelectedColumn),
+    error,
+  };
 }

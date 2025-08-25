@@ -1,6 +1,7 @@
 import { DataTable } from "@/src/components/table/data-table";
 import { type LangfuseColumnDef } from "@/src/components/table/types";
 import { api } from "@/src/utils/api";
+import { safeExtract } from "@/src/utils/map-utils";
 import { useQueryParams, withDefault, NumberParam } from "use-query-params";
 import { type RouterOutput } from "@/src/utils/types";
 import useColumnVisibility from "@/src/features/column-visibility/hooks/useColumnVisibility";
@@ -34,6 +35,7 @@ type RowData = {
   countPendingItems: number;
   scoreConfigs: { id: string; name: string; dataType: ScoreDataType }[];
   createdAt: string;
+  isAssigned: boolean;
 };
 
 export function AnnotationQueuesTable({ projectId }: { projectId: string }) {
@@ -213,6 +215,7 @@ export function AnnotationQueuesTable({ projectId }: { projectId: string }) {
       createdAt: item.createdAt.toLocaleString(),
       countCompletedItems: item.countCompletedItems,
       countPendingItems: item.countPendingItems,
+      isAssigned: item.isCurrentUserAssigned,
     };
   };
 
@@ -238,6 +241,7 @@ export function AnnotationQueuesTable({ projectId }: { projectId: string }) {
         setRowHeight={setRowHeight}
       />
       <DataTable
+        tableName={"annotationQueues"}
         columns={columns}
         data={
           queues.isLoading
@@ -251,7 +255,9 @@ export function AnnotationQueuesTable({ projectId }: { projectId: string }) {
               : {
                   isLoading: false,
                   isError: false,
-                  data: queues.data.queues.map((t) => convertToTableRow(t)),
+                  data: safeExtract(queues.data, "queues", []).map((t) =>
+                    convertToTableRow(t),
+                  ),
                 }
         }
         pagination={{
@@ -264,6 +270,9 @@ export function AnnotationQueuesTable({ projectId }: { projectId: string }) {
         columnOrder={columnOrder}
         onColumnOrderChange={setColumnOrder}
         rowHeight={rowHeight}
+        getRowClassName={(row) =>
+          row.isAssigned ? "bg-primary/5 border-l-4 border-l-primary/40" : ""
+        }
       />
     </>
   );

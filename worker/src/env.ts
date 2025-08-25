@@ -14,6 +14,10 @@ const EnvSchema = z.object({
     .max(65536, `options.port should be >= 0 and < 65536`)
     .default(3030),
 
+  NEXTAUTH_URL: z.string().optional(),
+
+  LANGFUSE_CACHE_AUTOMATIONS_ENABLED: z.enum(["true", "false"]).default("true"),
+  LANGFUSE_CACHE_AUTOMATIONS_TTL_SECONDS: z.coerce.number().default(60),
   LANGFUSE_S3_BATCH_EXPORT_ENABLED: z.enum(["true", "false"]).default("false"),
   LANGFUSE_S3_BATCH_EXPORT_BUCKET: z.string().optional(),
   LANGFUSE_S3_BATCH_EXPORT_PREFIX: z.string().default(""),
@@ -76,22 +80,13 @@ const EnvSchema = z.object({
     .number()
     .positive()
     .default(3),
-  REDIS_HOST: z.string().nullish(),
-  REDIS_PORT: z.coerce
-    .number() // .env files convert numbers to strings, therefore we have to enforce them to be numbers
-    .positive()
-    .max(65536, `options.port should be >= 0 and < 65536`)
-    .default(6379)
-    .nullable(),
-  REDIS_AUTH: z.string().nullish(),
-  REDIS_CONNECTION_STRING: z.string().nullish(),
-  REDIS_ENABLE_AUTO_PIPELINING: z.enum(["true", "false"]).default("true"),
 
   CLICKHOUSE_URL: z.string().url(),
   CLICKHOUSE_USER: z.string(),
   CLICKHOUSE_CLUSTER_NAME: z.string().default("default"),
   CLICKHOUSE_DB: z.string().default("default"),
   CLICKHOUSE_PASSWORD: z.string(),
+  CLICKHOUSE_CLUSTER_ENABLED: z.enum(["true", "false"]).default("true"),
   LANGFUSE_EVAL_CREATOR_WORKER_CONCURRENCY: z.coerce
     .number()
     .positive()
@@ -102,6 +97,7 @@ const EnvSchema = z.object({
     .default(25),
   LANGFUSE_TRACE_DELETE_CONCURRENCY: z.coerce.number().positive().default(1),
   LANGFUSE_SCORE_DELETE_CONCURRENCY: z.coerce.number().positive().default(1),
+  LANGFUSE_DATASET_DELETE_CONCURRENCY: z.coerce.number().positive().default(1),
   LANGFUSE_PROJECT_DELETE_CONCURRENCY: z.coerce.number().positive().default(1),
   LANGFUSE_EVAL_EXECUTION_WORKER_CONCURRENCY: z.coerce
     .number()
@@ -136,8 +132,9 @@ const EnvSchema = z.object({
     .enum(["true", "false"])
     .default("false"),
 
-  LANGFUSE_CACHE_MODEL_MATCH_ENABLED: z.enum(["true", "false"]).default("true"),
-  LANGFUSE_CACHE_MODEL_MATCH_TTL_SECONDS: z.coerce.number().default(30),
+  LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG: z
+    .enum(["true", "false"])
+    .default("true"),
 
   // Flags to toggle queue consumers on or off.
   QUEUE_CONSUMER_CLOUD_USAGE_METERING_QUEUE_IS_ENABLED: z
@@ -167,6 +164,9 @@ const EnvSchema = z.object({
   QUEUE_CONSUMER_SCORE_DELETE_QUEUE_IS_ENABLED: z
     .enum(["true", "false"])
     .default("true"),
+  QUEUE_CONSUMER_DATASET_DELETE_QUEUE_IS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true"),
   QUEUE_CONSUMER_PROJECT_DELETE_QUEUE_IS_ENABLED: z
     .enum(["true", "false"])
     .default("true"),
@@ -191,6 +191,12 @@ const EnvSchema = z.object({
   QUEUE_CONSUMER_DEAD_LETTER_RETRY_QUEUE_IS_ENABLED: z
     .enum(["true", "false"])
     .default("false"),
+  QUEUE_CONSUMER_WEBHOOK_QUEUE_IS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true"),
+  QUEUE_CONSUMER_ENTITY_CHANGE_QUEUE_IS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true"),
 
   // Core data S3 upload - Langfuse Cloud
   LANGFUSE_S3_CORE_DATA_EXPORT_IS_ENABLED: z
@@ -226,11 +232,6 @@ const EnvSchema = z.object({
     .enum(["true", "false"])
     .default("false"),
 
-  // Whether to collect queue length metrics. Experimental flag to understand redis performance around this command.
-  LANGFUSE_COLLECT_QUEUE_LENGTH_METRICS: z
-    .enum(["true", "false"])
-    .default("true"),
-
   LANGFUSE_S3_CONCURRENT_READS: z.coerce.number().positive().default(50),
   LANGFUSE_CLICKHOUSE_PROJECT_DELETION_CONCURRENCY_DURATION_MS: z.coerce
     .number()
@@ -240,9 +241,37 @@ const EnvSchema = z.object({
     .number()
     .positive()
     .default(120_000), // 2 minutes
+  LANGFUSE_CLICKHOUSE_DATASET_DELETION_CONCURRENCY_DURATION_MS: z.coerce
+    .number()
+    .positive()
+    .default(120_000), // 2 minutes
+
+  LANGFUSE_EXPERIMENT_INSERT_INTO_TRACES_TABLE: z
+    .enum(["true", "false"])
+    .default("true"),
+  LANGFUSE_EXPERIMENT_INSERT_INTO_AGGREGATING_MERGE_TREES: z
+    .enum(["true", "false"])
+    .default("false"),
+  LANGFUSE_EXPERIMENT_RETURN_NEW_RESULT: z
+    .enum(["true", "false"])
+    .default("false"),
+
+  LANGFUSE_WEBHOOK_QUEUE_PROCESSING_CONCURRENCY: z.coerce
+    .number()
+    .positive()
+    .default(5),
+  LANGFUSE_WEBHOOK_TIMEOUT_MS: z.coerce.number().positive().default(10000),
+  LANGFUSE_ENTITY_CHANGE_QUEUE_PROCESSING_CONCURRENCY: z.coerce
+    .number()
+    .positive()
+    .default(2),
+  LANGFUSE_DELETE_BATCH_SIZE: z.coerce.number().positive().default(2000),
+  LANGFUSE_EXPERIMENT_DATASET_RUN_ITEMS_TRACE_SOURCE_CH: z
+    .enum(["true", "false"])
+    .default("true"),
 });
 
 export const env: z.infer<typeof EnvSchema> =
-  process.env.DOCKER_BUILD === "1"
+  process.env.DOCKER_BUILD === "1" // eslint-disable-line turbo/no-undeclared-env-vars
     ? (process.env as any)
     : EnvSchema.parse(removeEmptyEnvVariables(process.env));

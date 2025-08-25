@@ -17,6 +17,8 @@ import {
   supportedModels,
   GCPServiceAccountKeySchema,
   BedrockConfigSchema,
+  VertexAIConfigSchema,
+  BEDROCK_USE_DEFAULT_CREDENTIALS,
 } from "@langfuse/shared";
 import { encrypt, decrypt } from "@langfuse/shared/encryption";
 import {
@@ -30,6 +32,9 @@ import { env } from "@/src/env.mjs";
 import { TRPCError } from "@trpc/server";
 
 export function getDisplaySecretKey(secretKey: string) {
+  if (secretKey === BEDROCK_USE_DEFAULT_CREDENTIALS) {
+    return "Default AWS credentials";
+  }
   return secretKey.endsWith('"}')
     ? "..." + secretKey.slice(-6, -2)
     : "..." + secretKey.slice(-4);
@@ -64,11 +69,6 @@ async function testLLMConnection(
 
     const testMessages: ChatMessage[] = [
       {
-        role: ChatMessageRole.System,
-        content: "You are a bot",
-        type: ChatMessageType.System,
-      },
-      {
         role: ChatMessageRole.User,
         content: "How are you?",
         type: ChatMessageType.User,
@@ -80,6 +80,11 @@ async function testLLMConnection(
     if (params.config && params.adapter === LLMAdapter.Bedrock) {
       const bedrockConfig = BedrockConfigSchema.parse(params.config);
       parsedConfig = { region: bedrockConfig.region };
+    } else if (params.config && params.adapter === LLMAdapter.VertexAI) {
+      const vertexAIConfig = VertexAIConfigSchema.parse(params.config);
+      parsedConfig = vertexAIConfig.location
+        ? { location: vertexAIConfig.location }
+        : null;
     }
 
     await fetchLLMCompletion({
@@ -118,6 +123,21 @@ export const llmApiKeyRouter = createTRPCRouter({
           projectId: input.projectId,
           scope: "llmApiKeys:create",
         });
+
+        // Validate that default credentials sentinel is only allowed for Bedrock in self-hosted deployments
+        if (input.secretKey === BEDROCK_USE_DEFAULT_CREDENTIALS) {
+          const isLangfuseCloud = Boolean(
+            env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION,
+          );
+
+          if (isLangfuseCloud || input.adapter !== LLMAdapter.Bedrock) {
+            throw new TRPCError({
+              code: "BAD_REQUEST",
+              message:
+                "Default credentials are only allowed for Bedrock in self-hosted deployments.",
+            });
+          }
+        }
 
         if (!env.ENCRYPTION_KEY) {
           if (env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION) {
@@ -269,6 +289,7 @@ export const llmApiKeyRouter = createTRPCRouter({
               customModels: true,
               withDefaultModels: true,
               extraHeaderKeys: true,
+              config: true,
             },
             where: {
               projectId: input.projectId,
@@ -400,6 +421,21 @@ export const llmApiKeyRouter = createTRPCRouter({
             code: "BAD_REQUEST",
             message: "Provider and adapter cannot be changed",
           });
+        }
+
+        // Validate that default credentials sentinel is only allowed for Bedrock in self-hosted deployments
+        if (input.secretKey === BEDROCK_USE_DEFAULT_CREDENTIALS) {
+          const isLangfuseCloud = Boolean(
+            env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION,
+          );
+
+          if (isLangfuseCloud || input.adapter !== LLMAdapter.Bedrock) {
+            throw new TRPCError({
+              code: "BAD_REQUEST",
+              message:
+                "Default credentials are only allowed for Bedrock in self-hosted deployments.",
+            });
+          }
         }
 
         // Ensure we delete extra headers if they existed before and were removed

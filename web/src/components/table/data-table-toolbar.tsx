@@ -58,6 +58,11 @@ interface SearchConfig {
   tableAllowsFullTextSearch?: boolean;
   setSearchType: ((newSearchType: TracingSearchType[]) => void) | undefined;
   searchType: TracingSearchType[] | undefined;
+  customDropdownLabels?: {
+    metadata: string;
+    fullText: string;
+  };
+  hidePerformanceWarning?: boolean;
 }
 
 interface TableViewControllers {
@@ -185,34 +190,28 @@ export function DataTableToolbar<TData, TValue>({
                     <span className="flex items-center gap-1 truncate">
                       {searchConfig.tableAllowsFullTextSearch &&
                       (searchConfig.searchType ?? []).includes("content")
-                        ? "Full Text"
-                        : "IDs / Names"}
+                        ? (searchConfig.customDropdownLabels?.fullText ??
+                          "Full Text")
+                        : (searchConfig.customDropdownLabels?.metadata ??
+                          "IDs / Names")}
                       <DocPopup
                         description={
-                          <>
+                          searchConfig.tableAllowsFullTextSearch &&
+                          (searchConfig.searchType ?? []).includes(
+                            "content",
+                          ) ? (
                             <p className="text-xs font-normal text-primary">
-                              <strong>Metadata search:</strong>{" "}
-                              {searchConfig.metadataSearchFields.join(", ")}
+                              Searches in Input/Output and{" "}
+                              {searchConfig.metadataSearchFields.join(", ")}.
+                              {!searchConfig.hidePerformanceWarning &&
+                                " For improved performance, please filter the table down."}
                             </p>
-                            {searchConfig.tableAllowsFullTextSearch ? (
-                              <>
-                                <p className="text-xs font-normal text-primary">
-                                  <strong>Full text search:</strong> Input,
-                                  Output
-                                </p>
-                                <br />
-                                <p className="text-xs font-normal text-primary">
-                                  For improved performance, filter the table
-                                  before searching.
-                                </p>
-                              </>
-                            ) : (
-                              <p className="mt-2 text-xs font-normal text-primary">
-                                Full text search (Input, Output) is not
-                                available for this table.
-                              </p>
-                            )}
-                          </>
+                          ) : (
+                            <p className="text-xs font-normal text-primary">
+                              Searches in{" "}
+                              {searchConfig.metadataSearchFields.join(", ")}.
+                            </p>
+                          )
                         }
                       />
                     </span>
@@ -242,13 +241,15 @@ export function DataTableToolbar<TData, TValue>({
                     }}
                   >
                     <DropdownMenuRadioItem value="metadata">
-                      IDs / Names
+                      {searchConfig.customDropdownLabels?.metadata ??
+                        "IDs / Names"}
                     </DropdownMenuRadioItem>
                     <DropdownMenuRadioItem
                       value="metadata_fulltext"
                       disabled={!searchConfig.tableAllowsFullTextSearch}
                     >
-                      Full Text
+                      {searchConfig.customDropdownLabels?.fullText ??
+                        "Full Text"}
                     </DropdownMenuRadioItem>
                   </DropdownMenuRadioGroup>
                 </DropdownMenuContent>

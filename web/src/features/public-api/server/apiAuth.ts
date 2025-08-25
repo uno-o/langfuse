@@ -8,6 +8,8 @@ import {
   OrgEnrichedApiKey,
   logger,
   instrumentAsync,
+  addUserToSpan,
+  safeMultiDel,
 } from "@langfuse/shared/src/server";
 import {
   type PrismaClient,
@@ -16,7 +18,7 @@ import {
   type ApiKeyScope,
 } from "@langfuse/shared/src/db";
 import { isPrismaException } from "@/src/utils/exceptions";
-import { type Redis } from "ioredis";
+import { type Redis, type Cluster } from "ioredis";
 import { getOrganizationPlanServerSide } from "@/src/features/entitlements/server/getPlan";
 import { API_KEY_NON_EXISTENT } from "@langfuse/shared/src/server";
 import { type z } from "zod/v4";
@@ -24,9 +26,9 @@ import { CloudConfigSchema, isPlan } from "@langfuse/shared";
 
 export class ApiAuthService {
   prisma: PrismaClient;
-  redis: Redis | null;
+  redis: Redis | Cluster | null;
 
-  constructor(prisma: PrismaClient, redis: Redis | null) {
+  constructor(prisma: PrismaClient, redis: Redis | Cluster | null) {
     this.prisma = prisma;
     this.redis = redis;
   }
@@ -47,9 +49,10 @@ export class ApiAuthService {
 
     if (this.redis) {
       logger.info(`Invalidating API keys in redis for ${identifier}`);
-      await this.redis.del(
-        filteredHashKeys.map((hash) => this.createRedisKey(hash)),
+      const keysToDelete = filteredHashKeys.map((hash) =>
+        this.createRedisKey(hash),
       );
+      await safeMultiDel(this.redis, keysToDelete);
     }
   }
 
@@ -121,7 +124,7 @@ export class ApiAuthService {
       { name: "api-auth-verify" },
       async () => {
         if (!authHeader) {
-          logger.error("No authorization header");
+          logger.debug("No authorization header");
           return {
             validKey: false,
             error: "No authorization header",
@@ -203,6 +206,12 @@ export class ApiAuthService {
               throw new Error("Invalid credentials");
             }
 
+            addUserToSpan({
+              projectId: finalApiKey.projectId ?? undefined,
+              orgId: finalApiKey.orgId,
+              plan,
+            });
+
             const accessLevel =
               finalApiKey.scope === "ORGANIZATION" ? "organization" : "project";
 
@@ -235,6 +244,12 @@ export class ApiAuthService {
             const { orgId, cloudConfig } =
               this.extractOrgIdAndCloudConfig(dbKey);
 
+            addUserToSpan({
+              projectId: dbKey.projectId ?? undefined,
+              orgId,
+              plan: getOrganizationPlanServerSide(cloudConfig),
+            });
+
             return {
               validKey: true,
               scope: {
@@ -250,7 +265,7 @@ export class ApiAuthService {
             };
           }
         } catch (error: unknown) {
-          logger.error(
+          logger.info(
             `Error verifying auth header: ${error instanceof Error ? error.message : null}`,
             error,
           );
@@ -272,6 +287,7 @@ export class ApiAuthService {
         };
       },
     );
+
     return result;
   }
 

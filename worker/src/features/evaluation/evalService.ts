@@ -1,9 +1,7 @@
 import { randomUUID } from "crypto";
 import { sql } from "kysely";
 import { z } from "zod/v4";
-// We continue to use zod v3 for langchainjs.
-// Corresponding issue report: https://github.com/langchain-ai/langchainjs/issues/8357.
-import { z as zv3 } from "zod";
+import { z as zodV3 } from "zod/v3";
 import { JobConfigState } from "@prisma/client";
 import {
   QueueJobs,
@@ -12,11 +10,11 @@ import {
   tableColumnsToSqlFilterAndPrefix,
   traceException,
   eventTypes,
-  redis,
+  setNoJobConfigsCache,
   IngestionQueue,
   logger,
   EvalExecutionQueue,
-  checkTraceExists,
+  checkTraceExistsAndGetTimestamp,
   checkObservationExists,
   DatasetRunItemUpsertEventType,
   TraceQueueEventType,
@@ -27,10 +25,20 @@ import {
   DefaultEvalModelService,
   getTraceById,
   getObservationForTraceIdByName,
+  InMemoryFilterService,
+  recordIncrement,
+  getCurrentSpan,
+  DatasetRunItemsOperationType,
+  executeWithDatasetRunItemsStrategy,
+  getDatasetItemIdsByTraceIdCh,
+  mapDatasetRunItemFilterColumn,
 } from "@langfuse/shared/src/server";
 import {
+  mapTraceFilterColumn,
+  requiresDatabaseLookup,
+} from "./traceFilterUtils";
+import {
   ChatMessageRole,
-  ForbiddenError,
   LangfuseNotFoundError,
   Prisma,
   singleFilter,
@@ -42,13 +50,14 @@ import {
   ScoreSource,
   availableTraceEvalVariables,
   variableMapping,
+  TraceDomain,
+  Observation,
+  DatasetItem,
+  QUEUE_ERROR_MESSAGES,
 } from "@langfuse/shared";
 import { kyselyPrisma, prisma } from "@langfuse/shared/src/db";
 import { backOff } from "exponential-backoff";
-import {
-  callStructuredLLM,
-  compileHandlebarString,
-} from "../../features/utilities";
+import { callStructuredLLM, compileHandlebarString } from "../utils";
 import { env } from "../../env";
 import { JSONPath } from "jsonpath-plus";
 
@@ -155,12 +164,18 @@ export const createEvalJobs = async ({
   jobTimestamp: Date;
   enforcedJobTimeScope?: JobTimeScope;
 }) => {
+  const span = getCurrentSpan();
+  if (span) {
+    span.setAttribute("messaging.bullmq.job.input.projectId", event.projectId);
+  }
+
   // Fetch all configs for a given project. Those may be dataset or trace configs.
   let configsQuery = kyselyPrisma.$kysely
     .selectFrom("job_configurations")
     .selectAll()
     .where(sql.raw("job_type::text"), "=", "EVAL")
-    .where("project_id", "=", event.projectId);
+    .where("project_id", "=", event.projectId)
+    .where(sql.raw("status::text"), "=", "ACTIVE");
 
   if ("configId" in event) {
     // if configid is set in the event, we only want to fetch the one config
@@ -180,13 +195,94 @@ export const createEvalJobs = async ({
   const configs = await configsQuery.execute();
 
   if (configs.length === 0) {
-    logger.debug("No evaluation jobs found for project", event.projectId);
+    logger.debug(
+      "No active evaluation jobs found for project",
+      event.projectId,
+    );
+
+    // Cache the fact that there are no job configurations for this project
+    // This helps avoid unnecessary database queries and queue processing
+    await setNoJobConfigsCache(event.projectId);
+
     return;
   }
 
   logger.debug(
     `Creating eval jobs for trace ${event.traceId} on project ${event.projectId}`,
   );
+
+  // Optimization: Fetch trace data once if we have multiple configs
+  let cachedTrace: TraceDomain | undefined | null = null;
+  recordIncrement("langfuse.evaluation-execution.config_count", configs.length);
+  if (configs.length > 1) {
+    try {
+      // Fetch trace data and store it. If observation data is required, we'll make a separate lookup.
+      // Those fields are used rarely, though.
+      cachedTrace = await getTraceById({
+        traceId: event.traceId,
+        projectId: event.projectId,
+        timestamp:
+          "timestamp" in event
+            ? new Date(event.timestamp)
+            : new Date(jobTimestamp),
+      });
+
+      recordIncrement("langfuse.evaluation-execution.trace_cache_fetch", 1, {
+        found: Boolean(cachedTrace).toString(),
+      });
+      logger.debug("Fetched trace for evaluation optimization", {
+        traceId: event.traceId,
+        projectId: event.projectId,
+        found: Boolean(cachedTrace),
+        configCount: configs.length,
+      });
+    } catch (error) {
+      logger.error("Failed to fetch trace for evaluation optimization", {
+        error,
+        traceId: event.traceId,
+        projectId: event.projectId,
+      });
+      // Continue without cached trace - will fall back to individual queries
+    }
+  }
+
+  // Note: We could parallelize this cache fetch with the getTraceById call above.
+  // This should increase throughput, but will also put more pressure on ClickHouse.
+  // Will keep it as-is for now, but that might be a useful change.
+  const datasetConfigs = configs.filter((c) => c.target_object === "dataset");
+  let cachedDatasetItemIds: { id: string; datasetId: string }[] | null = null;
+  if (datasetConfigs.length > 1) {
+    try {
+      cachedDatasetItemIds = await getDatasetItemIdsByTraceIdCh({
+        projectId: event.projectId,
+        traceId: event.traceId,
+        filter: [],
+      });
+      recordIncrement(
+        "langfuse.evaluation-execution.dataset_item_cache_fetch",
+        1,
+        {
+          found: Boolean(cachedDatasetItemIds.length > 0).toString(),
+        },
+      );
+      logger.debug("Fetched dataset item ids for evaluation optimization", {
+        traceId: event.traceId,
+        projectId: event.projectId,
+        found: Boolean(cachedDatasetItemIds.length > 0),
+        configCount: datasetConfigs.length,
+      });
+    } catch (error) {
+      logger.error(
+        "Failed to fetch datasetItemIds for evaluation optimization",
+        {
+          error,
+          traceId: event.traceId,
+          projectId: event.projectId,
+        },
+      );
+      // Continue without cached dataset item ids - will fall back to individual queries
+    }
+  }
 
   for (const config of configs) {
     if (config.status === JobConfigState.INACTIVE) {
@@ -204,21 +300,55 @@ export const createEvalJobs = async ({
         : undefined;
 
     // Check whether the trace already exists in the database.
-    const traceExists = await checkTraceExists({
-      projectId: event.projectId,
-      traceId: event.traceId,
-      // Fallback to jobTimestamp if no payload timestamp is set to allow for successful retry attempts.
-      timestamp:
-        "timestamp" in event
-          ? new Date(event.timestamp)
-          : new Date(jobTimestamp),
-      filter: config.target_object === "trace" ? validatedFilter : [],
-      maxTimeStamp,
-      exactTimestamp:
-        "exactTimestamp" in event && event.exactTimestamp
-          ? new Date(event.exactTimestamp)
-          : undefined,
-    });
+    let traceExists = false;
+    let traceTimestamp: Date | undefined = cachedTrace?.timestamp;
+
+    // Use cached trace for in-memory filtering when possible, i.e. all fields can
+    // be checked in-memory.
+    const traceFilter = config.target_object === "trace" ? validatedFilter : [];
+    if (cachedTrace && !requiresDatabaseLookup(traceFilter)) {
+      // Evaluate filter in memory using the cached trace
+      traceExists = InMemoryFilterService.evaluateFilter(
+        cachedTrace,
+        traceFilter,
+        mapTraceFilterColumn,
+      );
+
+      recordIncrement("langfuse.evaluation-execution.trace_cache_check", 1, {
+        matches: traceExists ? "true" : "false",
+      });
+      logger.debug("Evaluated trace filter in memory", {
+        traceId: event.traceId,
+        configId: config.id,
+        matches: traceExists,
+        filterCount: traceFilter.length,
+      });
+    } else {
+      // Fall back to database query for complex filters or when no cached trace
+      const { exists, timestamp } = await checkTraceExistsAndGetTimestamp({
+        projectId: event.projectId,
+        traceId: event.traceId,
+        // Fallback to jobTimestamp if no payload timestamp is set to allow for successful retry attempts.
+        timestamp:
+          "timestamp" in event
+            ? new Date(event.timestamp)
+            : new Date(jobTimestamp),
+        filter: traceFilter,
+        maxTimeStamp,
+        exactTimestamp:
+          "exactTimestamp" in event && event.exactTimestamp
+            ? new Date(event.exactTimestamp)
+            : undefined,
+      });
+      traceExists = exists;
+      traceTimestamp = timestamp;
+      recordIncrement("langfuse.evaluation-execution.trace_db_lookup", 1, {
+        hasCached: Boolean(cachedTrace).toString(),
+        requiredDatabaseLookup: requiresDatabaseLookup(traceFilter)
+          ? "true"
+          : "false",
+      });
+    }
 
     const isDatasetConfig = config.target_object === "dataset";
     let datasetItem: { id: string } | undefined;
@@ -242,19 +372,49 @@ export const createEvalJobs = async ({
         `);
         datasetItem = datasetItems.shift();
       } else {
-        // Otherwise, try to find the dataset item id from datasetRunItems.
-        // Here, we can search for the traceId and projectId and should only get one result.
-        const datasetItems = await prisma.$queryRaw<
-          Array<{ id: string }>
-        >(Prisma.sql`
-          SELECT dataset_item_id as id
-          FROM dataset_run_items as dri
-          JOIN dataset_items as di ON di.id = dri.dataset_item_id AND di.project_id = ${event.projectId}
-          WHERE dri.project_id = ${event.projectId}
-            AND dri.trace_id = ${event.traceId}
-            ${condition}
-        `);
-        datasetItem = datasetItems.shift();
+        datasetItem = await executeWithDatasetRunItemsStrategy({
+          input: {},
+          operationType: DatasetRunItemsOperationType.READ,
+          postgresExecution: async () => {
+            // Otherwise, try to find the dataset item id from datasetRunItems.
+            // Here, we can search for the traceId and projectId and should only get one result.
+            const datasetItems = await prisma.$queryRaw<
+              Array<{ id: string }>
+            >(Prisma.sql`
+              SELECT dataset_item_id as id
+              FROM dataset_run_items as dri
+              JOIN dataset_items as di ON di.id = dri.dataset_item_id AND di.project_id = ${event.projectId}
+              WHERE dri.project_id = ${event.projectId}
+                AND dri.trace_id = ${event.traceId}
+                ${condition}
+            `);
+            return datasetItems.shift();
+          },
+          clickhouseExecution: async () => {
+            // If the cached items are not null, we fetched all available datasetItemIds from the DB.
+            // The dataset is the only allowed filter today, so it should be easy to check using our existing in memory filter.
+            if (cachedDatasetItemIds !== null) {
+              // Try to return from cache
+              // Note that the entity is _NOT_ a true datasetRunItem here. The mapping logic works, but we need to keep in mind
+              // that the `id` column is the `datasetItemId` _not_ the `datasetRunItemId`!
+              return cachedDatasetItemIds.find((di) =>
+                InMemoryFilterService.evaluateFilter(
+                  di,
+                  config.target_object === "dataset" ? validatedFilter : [],
+                  mapDatasetRunItemFilterColumn,
+                ),
+              );
+            } else {
+              const datasetItemIds = await getDatasetItemIdsByTraceIdCh({
+                projectId: event.projectId,
+                traceId: event.traceId,
+                filter:
+                  config.target_object === "dataset" ? validatedFilter : [],
+              });
+              return datasetItemIds.shift();
+            }
+          },
+        });
       }
     }
 
@@ -339,6 +499,7 @@ export const createEvalJobs = async ({
           projectId: event.projectId,
           jobConfigurationId: config.id,
           jobInputTraceId: event.traceId,
+          jobInputTraceTimestamp: traceTimestamp,
           jobTemplateId: config.eval_template_id,
           status: "PENDING",
           startTime: new Date(),
@@ -362,6 +523,10 @@ export const createEvalJobs = async ({
             projectId: event.projectId,
             jobExecutionId: jobExecutionId,
             delay: config.delay,
+          },
+          retryBaggage: {
+            originalJobTimestamp: new Date(),
+            attempt: 0,
           },
         },
         {
@@ -393,6 +558,11 @@ export const evaluate = async ({
 }: {
   event: z.infer<typeof EvalExecutionEvent>;
 }) => {
+  const span = getCurrentSpan();
+  if (span) {
+    span.setAttribute("messaging.bullmq.job.input.projectId", event.projectId);
+  }
+
   logger.debug(
     `Evaluating job ${event.jobExecutionId} for project ${event.projectId}`,
   );
@@ -411,13 +581,7 @@ export const evaluate = async ({
     return;
   }
 
-  if (!job?.job_input_trace_id) {
-    throw new ForbiddenError(
-      "Jobs can only be executed on traces and dataset runs for now.",
-    );
-  }
-
-  if (job.status === "CANCELLED") {
+  if (job.status === "CANCELLED" || !job?.job_input_trace_id) {
     logger.debug(`Job ${job.id} for project ${event.projectId} was cancelled.`);
 
     await kyselyPrisma.$kysely
@@ -466,6 +630,7 @@ export const evaluate = async ({
     projectId: event.projectId,
     variables: template.vars,
     traceId: job.job_input_trace_id,
+    traceTimestamp: job.job_input_trace_timestamp ?? undefined,
     datasetItemId: job.job_input_dataset_item_id ?? undefined,
     variableMapping: parsedVariableMapping,
   });
@@ -497,10 +662,10 @@ export const evaluate = async ({
     `Evaluating job ${event.jobExecutionId} compiled prompt ${prompt}`,
   );
 
-  const parsedOutputSchema = zv3
+  const parsedOutputSchema = z
     .object({
-      score: zv3.string(),
-      reasoning: zv3.string(),
+      score: z.string(),
+      reasoning: z.string(),
     })
     .parse(template.outputSchema);
 
@@ -508,9 +673,9 @@ export const evaluate = async ({
     throw new InvalidRequestError("Output schema not found");
   }
 
-  const evalScoreSchema = zv3.object({
-    reasoning: zv3.string().describe(parsedOutputSchema.reasoning),
-    score: zv3.number().describe(parsedOutputSchema.score),
+  const evalScoreSchema = zodV3.object({
+    reasoning: zodV3.string().describe(parsedOutputSchema.reasoning),
+    score: zodV3.number().describe(parsedOutputSchema.score),
   });
 
   const modelConfig = await DefaultEvalModelService.fetchValidModelConfig(
@@ -521,7 +686,7 @@ export const evaluate = async ({
   );
 
   if (!modelConfig.valid) {
-    logger.error(
+    logger.warn(
       `Evaluating job ${event.jobExecutionId} will fail. ${modelConfig.error}`,
     );
     throw new LangfuseNotFoundError(modelConfig.error);
@@ -587,30 +752,29 @@ export const evaluate = async ({
       },
     ]);
 
-    if (redis) {
-      const queue = IngestionQueue.getInstance();
-      if (!queue) {
-        throw new Error("Ingestion queue not available");
-      }
-      await queue.add(QueueJobs.IngestionJob, {
-        id: randomUUID(),
-        timestamp: new Date(),
-        name: QueueJobs.IngestionJob as const,
-        payload: {
-          data: {
-            type: eventTypes.SCORE_CREATE,
-            eventBodyId: scoreId,
-            fileKey: eventId,
-          },
-          authCheck: {
-            validKey: true,
-            scope: {
-              projectId: event.projectId,
-            },
+    const shardingKey = `${event.projectId}-${scoreId}`;
+    const queue = IngestionQueue.getInstance({ shardingKey });
+    if (!queue) {
+      throw new Error("Ingestion queue not available");
+    }
+    await queue.add(QueueJobs.IngestionJob, {
+      id: randomUUID(),
+      timestamp: new Date(),
+      name: QueueJobs.IngestionJob as const,
+      payload: {
+        data: {
+          type: eventTypes.SCORE_CREATE,
+          eventBodyId: scoreId,
+          fileKey: eventId,
+        },
+        authCheck: {
+          validKey: true,
+          scope: {
+            projectId: event.projectId,
           },
         },
-      });
-    }
+      },
+    });
   } catch (e) {
     logger.error(`Failed to add score into IngestionQueue: ${e}`, e);
     traceException(e);
@@ -639,6 +803,7 @@ export async function extractVariablesFromTracingData({
   variables,
   traceId,
   variableMapping,
+  traceTimestamp,
   datasetItemId,
 }: {
   projectId: string;
@@ -646,149 +811,188 @@ export async function extractVariablesFromTracingData({
   traceId: string;
   // this here are variables which were inserted by users. Need to validate before DB query.
   variableMapping: z.infer<typeof variableMappingList>;
+  traceTimestamp?: Date;
   datasetItemId?: string;
 }): Promise<{ var: string; value: string; environment?: string }[]> {
-  return Promise.all(
-    variables.map(async (variable) => {
-      const mapping = variableMapping.find(
-        (m) => m.templateVariable === variable,
-      );
+  // Internal cache for this function call to avoid duplicate database lookups.
+  // We do not cache dataset items as Postgres is cheaper than ClickHouse.
+  const traceCache = new Map<string, TraceDomain | null>();
+  const observationCache = new Map<string, Observation | null>();
 
-      // validation ensures that mapping is always defined for a variable
-      if (!mapping) {
-        logger.debug(`No mapping found for variable ${variable}`);
-        return { var: variable, value: "" };
-      }
-      if (mapping.langfuseObject === "dataset_item") {
-        if (!datasetItemId) {
-          logger.error(
-            `No dataset item id found for variable ${variable}. Eval will succeed without dataset item input.`,
-          );
-          return { var: variable, value: "" };
-        }
+  const results: { var: string; value: string; environment?: string }[] = [];
 
-        // find the internal definitions of the column
-        const safeInternalColumn = availableDatasetEvalVariables
-          .find((o) => o.id === "dataset_item")
-          ?.availableColumns.find((col) => col.id === mapping.selectedColumnId);
+  // We run through this list sequentially to make use of caching.
+  // The performance improvement by parallel execution should be less than the improvement we gain by caching.
+  for (const variable of variables) {
+    const mapping = variableMapping.find(
+      (m) => m.templateVariable === variable,
+    );
 
-        // if no column was found, we still process with an empty variable
-        if (!safeInternalColumn?.id) {
-          logger.error(
-            `No column found for variable ${variable} and column ${mapping.selectedColumnId}`,
-          );
-          return { var: variable, value: "" };
-        }
-
-        const datasetItem = await kyselyPrisma.$kysely
-          .selectFrom("dataset_items as d")
-          .select(
-            sql`${sql.raw(safeInternalColumn.internal)}`.as(
-              safeInternalColumn.id,
-            ),
-          ) // query the internal column name raw
-          .where("id", "=", datasetItemId)
-          .where("project_id", "=", projectId)
-          .executeTakeFirst();
-
-        // user facing errors
-        if (!datasetItem) {
-          logger.error(
-            `Dataset item ${datasetItemId} for project ${projectId} not found. Eval will succeed without dataset item input. Please ensure the mapped data on the dataset item exists and consider extending the job delay.`,
-          );
-          throw new LangfuseNotFoundError(
-            `Dataset item ${datasetItemId} for project ${projectId} not found. Eval will succeed without dataset item input. Please ensure the mapped data on the dataset item exists and consider extending the job delay.`,
-          );
-        }
-
-        return {
-          var: variable,
-          value: parseDatabaseRowToString(datasetItem, mapping),
-        };
+    // validation ensures that mapping is always defined for a variable
+    if (!mapping) {
+      logger.debug(`No mapping found for variable ${variable}`);
+      results.push({ var: variable, value: "" });
+      continue;
+    }
+    if (mapping.langfuseObject === "dataset_item") {
+      if (!datasetItemId) {
+        logger.warn(
+          `No dataset item id found for variable ${variable}. Eval will succeed without dataset item input.`,
+        );
+        results.push({ var: variable, value: "" });
+        continue;
       }
 
-      if (mapping.langfuseObject === "trace") {
-        // find the internal definitions of the column
-        const safeInternalColumn = availableTraceEvalVariables
-          .find((o) => o.id === "trace")
-          ?.availableColumns.find((col) => col.id === mapping.selectedColumnId);
+      // find the internal definitions of the column
+      const safeInternalColumn = availableDatasetEvalVariables
+        .find((o) => o.id === "dataset_item")
+        ?.availableColumns.find((col) => col.id === mapping.selectedColumnId);
 
-        // if no column was found, we still process with an empty variable
-        if (!safeInternalColumn?.id) {
-          logger.error(
-            `No column found for variable ${variable} and column ${mapping.selectedColumnId}`,
-          );
-          return { var: variable, value: "" };
-        }
-
-        const trace = await getTraceById({ traceId, projectId });
-
-        // user facing errors
-        if (!trace) {
-          logger.error(
-            `Trace ${traceId} for project ${projectId} not found. Eval will succeed without trace input. Please ensure the mapped data on the trace exists and consider extending the job delay.`,
-          );
-          throw new LangfuseNotFoundError(
-            `Trace ${traceId} for project ${projectId} not found. Eval will succeed without trace input. Please ensure the mapped data on the trace exists and consider extending the job delay.`,
-          );
-        }
-
-        return {
-          var: variable,
-          value: parseDatabaseRowToString(trace, mapping),
-          environment: trace.environment,
-        };
+      // if no column was found, we still process with an empty variable
+      if (!safeInternalColumn?.id) {
+        logger.error(
+          `No column found for variable ${variable} and column ${mapping.selectedColumnId}`,
+        );
+        results.push({ var: variable, value: "" });
+        continue;
       }
 
-      if (["generation", "span", "event"].includes(mapping.langfuseObject)) {
-        const safeInternalColumn = availableTraceEvalVariables
-          .find((o) => o.id === mapping.langfuseObject)
-          ?.availableColumns.find((col) => col.id === mapping.selectedColumnId);
+      const datasetItem = (await kyselyPrisma.$kysely
+        .selectFrom("dataset_items as d")
+        .select(
+          sql`${sql.raw(safeInternalColumn.internal)}`.as(
+            safeInternalColumn.id,
+          ),
+        ) // query the internal column name raw
+        .where("id", "=", datasetItemId)
+        .where("project_id", "=", projectId)
+        .executeTakeFirst()) as DatasetItem;
 
-        if (!mapping.objectName) {
-          logger.info(
-            `No object name found for variable ${variable} and object ${mapping.langfuseObject}`,
-          );
-          return { var: variable, value: "" };
-        }
-
-        if (!safeInternalColumn?.id) {
-          logger.warn(
-            `No column found for variable ${variable} and column ${mapping.selectedColumnId}`,
-          );
-          return { var: variable, value: "" };
-        }
-
-        const observation = (
-          await getObservationForTraceIdByName(
-            traceId,
-            projectId,
-            mapping.objectName,
-            undefined,
-            true,
-          )
-        ).shift(); // We only take the first match and ignore duplicate generation-names in a trace.
-
-        // user facing errors
-        if (!observation) {
-          logger.error(
-            `Observation ${mapping.objectName} for trace ${traceId} not found. Please ensure the mapped data exists and consider extending the job delay.`,
-          );
-          throw new LangfuseNotFoundError(
-            `Observation ${mapping.objectName} for trace ${traceId} not found. Please ensure the mapped data exists and consider extending the job delay.`,
-          );
-        }
-
-        return {
-          var: variable,
-          value: parseDatabaseRowToString(observation, mapping),
-          environment: observation.environment,
-        };
+      // user facing errors
+      if (!datasetItem) {
+        logger.error(
+          `Dataset item ${datasetItemId} for project ${projectId} not found. Please ensure the mapped data on the dataset item exists and consider extending the job delay.`,
+        );
+        // this should only happen for deleted data.
+        throw new LangfuseNotFoundError(
+          `Dataset item ${datasetItemId} for project ${projectId} not found. Please ensure the mapped data on the dataset item exists and consider extending the job delay.`,
+        );
       }
 
-      throw new Error(`Unknown object type ${mapping.langfuseObject}`);
-    }),
-  );
+      results.push({
+        var: variable,
+        value: parseDatabaseRowToString(datasetItem, mapping),
+      });
+      continue;
+    }
+
+    if (mapping.langfuseObject === "trace") {
+      // find the internal definitions of the column
+      const safeInternalColumn = availableTraceEvalVariables
+        .find((o) => o.id === "trace")
+        ?.availableColumns.find((col) => col.id === mapping.selectedColumnId);
+
+      // if no column was found, we still process with an empty variable
+      if (!safeInternalColumn?.id) {
+        logger.error(
+          `No column found for variable ${variable} and column ${mapping.selectedColumnId}`,
+        );
+        results.push({ var: variable, value: "" });
+        continue;
+      }
+
+      const traceCacheKey = `${projectId}:${traceId}`;
+      let trace = traceCache.get(traceCacheKey);
+      if (!traceCache.has(traceCacheKey)) {
+        trace = await getTraceById({
+          traceId,
+          projectId,
+          timestamp: traceTimestamp,
+        });
+        traceCache.set(traceCacheKey, trace ?? null);
+      }
+
+      // user facing errors
+      if (!trace) {
+        logger.warn(
+          `Trace ${traceId} for project ${projectId} not found. Please ensure the mapped data on the trace exists and consider extending the job delay.`,
+        );
+        // this should only happen for deleted data or replication lags across clickhouse nodes.
+        throw new LangfuseNotFoundError(
+          `Trace ${traceId} for project ${projectId} not found. Please ensure the mapped data on the trace exists and consider extending the job delay.`,
+        );
+      }
+
+      results.push({
+        var: variable,
+        value: parseDatabaseRowToString(trace, mapping),
+        environment: trace.environment,
+      });
+      continue;
+    }
+
+    const observationTypes = availableTraceEvalVariables
+      .filter((obj) => obj.id !== "trace") // trace is handled separately above
+      .map((obj) => obj.id);
+
+    if (observationTypes.includes(mapping.langfuseObject)) {
+      const safeInternalColumn = availableTraceEvalVariables
+        .find((o) => o.id === mapping.langfuseObject)
+        ?.availableColumns.find((col) => col.id === mapping.selectedColumnId);
+
+      if (!mapping.objectName) {
+        logger.info(
+          `No object name found for variable ${variable} and object ${mapping.langfuseObject}`,
+        );
+        results.push({ var: variable, value: "" });
+        continue;
+      }
+
+      if (!safeInternalColumn?.id) {
+        logger.warn(
+          `No column found for variable ${variable} and column ${mapping.selectedColumnId}`,
+        );
+        results.push({ var: variable, value: "" });
+        continue;
+      }
+
+      const observationCacheKey = `${projectId}:${traceId}:${mapping.objectName}`;
+      let observation = observationCache.get(observationCacheKey);
+      if (!observationCache.has(observationCacheKey)) {
+        const observations = await getObservationForTraceIdByName({
+          traceId,
+          projectId,
+          name: mapping.objectName,
+          timestamp: traceTimestamp,
+          fetchWithInputOutput: true,
+        });
+        observation = observations.shift() || null; // We only take the first match and ignore duplicate generation-names in a trace.
+        observationCache.set(observationCacheKey, observation);
+      }
+
+      // user facing errors
+      if (!observation) {
+        logger.warn(
+          `Observation ${mapping.objectName} for trace ${traceId} not found. ${QUEUE_ERROR_MESSAGES.MAPPED_DATA_ERROR}`,
+        );
+        // this should only happen for deleted data or data replication lags across clickhouse nodes.
+        throw new LangfuseNotFoundError(
+          `Observation ${mapping.objectName} for trace ${traceId} not found. ${QUEUE_ERROR_MESSAGES.MAPPED_DATA_ERROR}`,
+        );
+      }
+
+      results.push({
+        var: variable,
+        value: parseDatabaseRowToString(observation, mapping),
+        environment: observation.environment,
+      });
+      continue;
+    }
+
+    throw new Error(`Unknown object type ${mapping.langfuseObject}`);
+  }
+
+  return results;
 }
 
 export const parseDatabaseRowToString = (

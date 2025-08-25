@@ -39,7 +39,7 @@ export default withMiddlewares({
       if (req.headers["content-encoding"]?.includes("gzip")) {
         try {
           body = await new Promise((resolve, reject) => {
-            gunzip(body, (err, result) =>
+            gunzip(new Uint8Array(body), (err, result) =>
               err ? reject(err) : resolve(result),
             );
           });
@@ -99,7 +99,7 @@ export default withMiddlewares({
 
       // We set a delay of 0 for OTel, as we never expect updates.
       // We also set the source to "otel" which helps us with metric tracking and skipping list calls for S3.
-      return processEventBatch(events, auth, 0, "otel");
+      return processEventBatch(events, auth, { delay: 0, source: "otel" });
     },
   }),
 });

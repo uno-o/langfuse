@@ -25,7 +25,8 @@ export default async function chatCompletionHandler(req: NextRequest) {
     const body = validateChatCompletionBody(await req.json());
     const { userId } = await authorizeRequestOrThrow(body.projectId);
 
-    const { messages, modelParams, tools, structuredOutputSchema } = body;
+    const { messages, modelParams, tools, structuredOutputSchema, streaming } =
+      body;
 
     const LLMApiKey = await prisma.llmApiKeys.findFirst({
       where: {
@@ -57,23 +58,71 @@ export default async function chatCompletionHandler(req: NextRequest) {
       config: parsedKey.data.config,
     };
 
-    if ((tools && tools.length > 0) || structuredOutputSchema) {
-      const { completion } = await fetchLLMCompletion({
+    if (structuredOutputSchema) {
+      const result = await fetchLLMCompletion({
         ...fetchLLMCompletionParams,
         streaming: false,
-        tools: tools ?? [],
         structuredOutputSchema,
       });
-
-      return NextResponse.json(completion);
+      return NextResponse.json(result.completion);
     }
 
-    const { completion } = await fetchLLMCompletion({
-      ...fetchLLMCompletionParams,
-      streaming: true,
-    });
+    // If messages contain tool results, we include tools in the request
+    const hasToolResults = messages.some((msg) => msg.type === "tool-result");
 
-    return new StreamingTextResponse(completion);
+    if ((tools && tools.length > 0) || hasToolResults) {
+      // Fix empty tool_call_id values by mapping to langgraph IDs
+      const fixedMessages = messages.map((msg) => {
+        if (
+          msg.type === "tool-result" &&
+          (!msg.toolCallId || msg.toolCallId === "")
+        ) {
+          const assistantMessages = messages
+            .filter((m) => m.type === "assistant-tool-call" && m.toolCalls)
+            .reverse();
+
+          // Find the first matching tool call by name
+          // Note: using 'as any' because we filtered for assistant-tool-call messages above
+          for (const prevMsg of assistantMessages) {
+            const matchingToolCall = (prevMsg as any).toolCalls.find(
+              (tc: any) => tc.name === (msg as any)._originalRole,
+            );
+            if (matchingToolCall && matchingToolCall.id) {
+              return {
+                ...msg,
+                toolCallId: matchingToolCall.id,
+              };
+            }
+          }
+        }
+
+        return msg;
+      });
+
+      const result = await (fetchLLMCompletion as any)({
+        ...fetchLLMCompletionParams,
+        messages: fixedMessages,
+        streaming: false,
+        tools: tools ?? [],
+      });
+      return NextResponse.json(result.completion);
+    }
+
+    if (streaming) {
+      const { completion } = await fetchLLMCompletion({
+        ...fetchLLMCompletionParams,
+        streaming,
+      });
+
+      return new StreamingTextResponse(completion);
+    } else {
+      const { completion } = await fetchLLMCompletion({
+        ...fetchLLMCompletionParams,
+        streaming,
+      });
+
+      return NextResponse.json({ content: completion });
+    }
   } catch (err) {
     logger.error("Failed to handle chat completion", err);
 
